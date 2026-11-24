@@ -1,13 +1,8 @@
-""" This function returns a string with the time elapsed between starttime,endtime """
-from typing import Callable
+"""This function returns a string with the time elapsed between starttime,endtime"""
 
-import time
-import logging
 
-import berry
-
-def tempo(starttime, endtime, name='program'):
-    """ Returns a string with the time elapsed between starttime,endtime """
+def tempo(starttime, endtime, name="program"):
+    """Returns a string with the time elapsed between starttime,endtime"""
 
     dif = round(endtime - starttime, 2)
     d = int(dif / 86400)
@@ -17,25 +12,9 @@ def tempo(starttime, endtime, name='program'):
     s = round(((leftseconds / 3600 - h) * 60 - m) * 60, 2)
 
     if d > 0:
-        string = (
-            f"The {name} ran for "
-            + str(d)
-            + " days, "
-            + str(h)
-            + " h, "
-            + str(m)
-            + " m"
-        )
+        string = f"The {name} ran for " + str(d) + " days, " + str(h) + " h, " + str(m) + " m"
     elif h > 0:
-        string = (
-            f"The {name} ran for "
-            + str(h)
-            + " h, "
-            + str(m)
-            + " m, "
-            + str(int(s))
-            + " s"
-        )
+        string = f"The {name} ran for " + str(h) + " h, " + str(m) + " m, " + str(int(s)) + " s"
     elif m > 0:
         string = f"The {name} ran for " + str(m) + " m, " + str(s) + " s"
     else:
@@ -43,8 +22,9 @@ def tempo(starttime, endtime, name='program'):
 
     return string
 
+
 def inter_time(interval):
-    """ Returns a string with the time interval."""
+    """Returns a string with the time interval."""
 
     d = int(interval / 86400)
     leftseconds = interval - d * 86400
@@ -53,23 +33,9 @@ def inter_time(interval):
     s = round(((leftseconds / 3600 - h) * 60 - m) * 60, 2)
 
     if d > 0:
-        string = (
-            str(d)
-            + " days, "
-            + str(h)
-            + " h, "
-            + str(m)
-            + " m"
-        )
+        string = str(d) + " days, " + str(h) + " h, " + str(m) + " m"
     elif h > 0:
-        string = (
-            str(h)
-            + " h, "
-            + str(m)
-            + " m, "
-            + str(int(s))
-            + " s"
-        )
+        string = str(h) + " h, " + str(m) + " m, " + str(int(s)) + " s"
     elif m > 0:
         string = str(m) + " m, " + str(s) + " s"
     else:

@@ -1,12 +1,14 @@
 import time
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
-from berry._subroutines.contatempo import tempo
-from berry._subroutines.headerfooter import header, footer
-import berry._subroutines.loadmeta as m
 import berry._subroutines.loaddata as d
+import berry._subroutines.loadmeta as m
+from berry._subroutines.contatempo import tempo
+from berry._subroutines.headerfooter import footer
+from berry._subroutines.headerfooter import header
+
 
 def corrected(args):
     header("DRAWBANDS", m.version, time.asctime())
@@ -14,7 +16,7 @@ def corrected(args):
     starttime = time.time()  # Starts counting time
 
     startband = args.mb - m.initial_band  # Number of the first band
-    endband = args.Mb - m.initial_band # Number of the last band
+    endband = args.Mb - m.initial_band  # Number of the last band
 
     fig = plt.figure(figsize=(6, 6))
 
@@ -54,20 +56,22 @@ def corrected(args):
     nbnd = m.nbnd
     print(" Number of bands:", nbnd)
     print()
-    eigenvalues = d.eigenvalues[:, m.initial_band:]
+    eigenvalues = d.eigenvalues[:, m.initial_band :]
     print(" Eigenvalues loaded")
     kpoints = d.kpoints
     print(" K-points loaded")
 
-    with open(m.data_dir+"/bandsfinal.npy", "rb") as f:
+    with open(m.data_dir + "/bandsfinal.npy", "rb") as f:
         bandsfinal = np.load(f)
     f.close()
     print(" bandsfinal loaded")
 
-    n_unsolved = int(np.count_nonzero(bandsfinal[:, startband:endband + 1] < 0))
+    n_unsolved = int(np.count_nonzero(bandsfinal[:, startband : endband + 1] < 0))
     if n_unsolved:
-        print(f" WARNING: {n_unsolved} unsolved point(s) (bandsfinal == -1) in the"
-              " selected range; they will be left blank (NaN) instead of plotted.")
+        print(
+            f" WARNING: {n_unsolved} unsolved point(s) (bandsfinal == -1) in the"
+            " selected range; they will be left blank (NaN) instead of plotted."
+        )
 
     if m.dimensions == 1:
         xarray = np.zeros(nkx)
@@ -75,16 +79,14 @@ def corrected(args):
         count = -1
         for i in range(nkx):
             count = count + 1
-            xarray[i] = kpoints[count,0]
+            xarray[i] = kpoints[count, 0]
         for banda in range(startband, endband + 1):
             count = -1
             for i in range(nkx):
                 count = count + 1
                 bf = bandsfinal[count, banda]
                 yarray[i] = eigenvalues[count, bf] if bf >= 0 else np.nan
-            plt.plot(xarray,yarray)
-
-
+            plt.plot(xarray, yarray)
 
     elif m.dimensions == 2:
         xarray = np.zeros((nkx, nky))
@@ -97,7 +99,7 @@ def corrected(args):
                 xarray[i, j] = kpoints[count, 0]
                 yarray[i, j] = kpoints[count, 1]
 
-        ax = fig.add_subplot(projection='3d')
+        ax = fig.add_subplot(projection="3d")
         for banda in range(startband, endband + 1):
             count = -1
             for j in range(nky):
@@ -105,7 +107,7 @@ def corrected(args):
                     count = count + 1
                     bf = bandsfinal[count, banda]
                     zarray[i, j] = eigenvalues[count, bf] if bf >= 0 else np.nan
-            colorband = np.mod(banda,20)
+            colorband = np.mod(banda, 20)
             ax.plot_wireframe(xarray, yarray, zarray, color=cores[colorband])
 
     # Para desenhar no mathematica!
@@ -124,14 +126,12 @@ def corrected(args):
     #     print('}', end = '')
     # print('};\n')
 
-
     # fig = plt.figure()
     # ax = fig.add_subplot(111, projection='3d')
 
     # ax.plot_trisurf(xarray, yarray, zarray, linewidth=0.2, antialiased=True)
 
     plt.show()
-
 
     #    sys.exit("Stop")
 
@@ -140,13 +140,14 @@ def corrected(args):
 
     footer(tempo(starttime, endtime))
 
+
 def machine(args):
     header("DRAWBANDS", m.version, time.asctime())
 
     starttime = time.time()  # Starts counting time
 
-    startband = args.mb - m.initial_band # Number of the first band
-    endband = args.Mb - m.initial_band # Number of the last band
+    startband = args.mb - m.initial_band  # Number of the first band
+    endband = args.Mb - m.initial_band  # Number of the last band
 
     fig = plt.figure(figsize=(6, 6))
 
@@ -186,7 +187,7 @@ def machine(args):
     nbnd = m.nbnd
     print(" Number of bands:", nbnd)
     print()
-    eigenvalues = d.eigenvalues[:, m.initial_band:]
+    eigenvalues = d.eigenvalues[:, m.initial_band :]
     print(" Eigenvalues loaded")
     kpoints = d.kpoints
     print(" K-points loaded")
@@ -197,18 +198,15 @@ def machine(args):
         count = -1
         for i in range(nkx):
             count = count + 1
-            xarray[i] = kpoints[count,0]
+            xarray[i] = kpoints[count, 0]
         for banda in range(startband, endband + 1):
             count = -1
             for i in range(nkx):
-                count = count + 1            
+                count = count + 1
                 yarray[i] = eigenvalues[count, banda]
-            plt.plot(xarray,yarray)
-
-
+            plt.plot(xarray, yarray)
 
     elif m.dimensions == 2:
-
         xarray = np.zeros((nkx, nky))
         yarray = np.zeros((nkx, nky))
         zarray = np.zeros((nkx, nky))
@@ -219,7 +217,7 @@ def machine(args):
                 xarray[i, j] = kpoints[count, 0]
                 yarray[i, j] = kpoints[count, 1]
 
-        ax = fig.add_subplot(projection='3d')
+        ax = fig.add_subplot(projection="3d")
         for banda in range(startband, endband + 1):
             count = -1
             for j in range(nky):
@@ -227,7 +225,7 @@ def machine(args):
                     count = count + 1
                     zarray[i, j] = eigenvalues[count, banda]
 
-            colorband = np.mod(banda,20)
+            colorband = np.mod(banda, 20)
             ax.plot_wireframe(xarray, yarray, zarray, color=cores[colorband])
 
     # Para desenhar no mathematica!
@@ -246,7 +244,6 @@ def machine(args):
     #     print('}', end = '')
     # print('};\n')
 
-
     # fig = plt.figure()
     # ax = fig.add_subplot(111, projection='3d')
 
@@ -254,13 +251,13 @@ def machine(args):
 
     plt.show()
 
-
     #    sys.exit("Stop")
 
     # Finished
     endtime = time.time()
 
     footer(tempo(starttime, endtime))
+
 
 def bands(args):
     if args.bands_vis == "corrected":

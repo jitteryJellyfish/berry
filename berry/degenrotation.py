@@ -1,28 +1,24 @@
 """
-  This program finds all degenerate subspaces in the Bloch wavefunctions,
-  groups neighboring degenerate k-points into connected zones, selects a
-  boundary reference k-point for each zone, and propagates an SVD-based
-  (Procrustes) basis rotation outward through each zone via BFS.
+This program finds all degenerate subspaces in the Bloch wavefunctions,
+groups neighboring degenerate k-points into connected zones, selects a
+boundary reference k-point for each zone, and propagates an SVD-based
+(Procrustes) basis rotation outward through each zone via BFS.
 
-  Run after wfcgen and before dot.
+Run after wfcgen and before dot.
 
-  For collinear calculations:   wavefunctions are complex arrays of shape (nr,).
-  For non-collinear calculations: each wavefunction is a spinor with two
-  components stored as separate files (band-0.wfc, band-1.wfc). The same
-  N×N unitary rotation is applied to both spinor components simultaneously.
+For collinear calculations:   wavefunctions are complex arrays of shape (nr,).
+For non-collinear calculations: each wavefunction is a spinor with two
+components stored as separate files (band-0.wfc, band-1.wfc). The same
+N×N unitary rotation is applied to both spinor components simultaneously.
 """
-import os
-import time
+
 import logging
-from collections import deque, defaultdict
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from itertools import combinations
+import os
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-from numpy.linalg import svd
-import scipy.linalg as sp_linalg
-import psutil
 
 from berry import log
 
@@ -36,13 +32,11 @@ except Exception:
 ENERGY_THRESHOLD = 0.005  # Ry (eigenvalues.npy is stored in Ry; 0.005 Ry ~ 68 meV); CLI -ethr overrides
 
 
-from berry._subroutines.rotation_core import (
-    _load_wfc, _save_wfc, _available_memory_bytes,
-    _overlap_matrix, _apply_rotation, _procrustes_rotation,
-    _correct_zone_holonomy, _degenerate_groups, _detect_kpt,
-    _refine_zone_gauge, _run_bfs_rotation, _process_zone_suffix,
-    _process_zone, build_zones,
-)
+from berry._subroutines.rotation_core import _available_memory_bytes
+from berry._subroutines.rotation_core import _degenerate_groups
+from berry._subroutines.rotation_core import _detect_kpt
+from berry._subroutines.rotation_core import _process_zone
+from berry._subroutines.rotation_core import build_zones
 
 # Module-level shared context populated by run_degenrotation before forking.
 # Workers read this dict (never write to it); large arrays are inherited via
@@ -61,32 +55,35 @@ def _process_zone_worker(args: tuple) -> list:
 
     """
     zi, sig, zone = args
-    ctx    = _zone_ctx
+    ctx = _zone_ctx
     import logging as _logging
-    logger = _logging.getLogger(ctx['logger_name'])
+
+    logger = _logging.getLogger(ctx["logger_name"])
     return _process_zone(
-        zi=zi, sig=sig, zone=zone,
-        d_phase         = ctx['d_phase'],
-        eigenvalues     = ctx['eigenvalues'],
-        neighbors       = ctx['neighbors'],
-        noncolin        = ctx['noncolin'],
-        wfcdir          = ctx['wfcdir'],
-        nr              = ctx['nr'],
-        n_dir           = ctx['n_dir'],
-        compress        = ctx['compress'],
-        ethr            = ctx['ethr'],
-        max_refinement_iter   = ctx['max_refinement_iter'],
-        refinement_iter_cap   = ctx['refinement_iter_cap'],
-        refinement_anderson_m = ctx['refinement_anderson_m'],
-        refinement_tol        = ctx['refinement_tol'],
-        holonomy_correction      = ctx['holonomy_correction'],
-        holonomy_max_iter        = ctx['holonomy_max_iter'],
-        holonomy_tol             = ctx['holonomy_tol'],
-        use_wfc_cache            = ctx['use_wfc_cache'],
-        n_workers                = 1,  # avoid nested parallelism inside a worker
-        logger                   = logger,
-        holonomy_min_plaquettes  = ctx.get('holonomy_min_plaquettes', 2),
-        mem_budget_bytes         = ctx.get('mem_budget_bytes'),
+        zi=zi,
+        sig=sig,
+        zone=zone,
+        d_phase=ctx["d_phase"],
+        eigenvalues=ctx["eigenvalues"],
+        neighbors=ctx["neighbors"],
+        noncolin=ctx["noncolin"],
+        wfcdir=ctx["wfcdir"],
+        nr=ctx["nr"],
+        n_dir=ctx["n_dir"],
+        compress=ctx["compress"],
+        ethr=ctx["ethr"],
+        max_refinement_iter=ctx["max_refinement_iter"],
+        refinement_iter_cap=ctx["refinement_iter_cap"],
+        refinement_anderson_m=ctx["refinement_anderson_m"],
+        refinement_tol=ctx["refinement_tol"],
+        holonomy_correction=ctx["holonomy_correction"],
+        holonomy_max_iter=ctx["holonomy_max_iter"],
+        holonomy_tol=ctx["holonomy_tol"],
+        use_wfc_cache=ctx["use_wfc_cache"],
+        n_workers=1,  # avoid nested parallelism inside a worker
+        logger=logger,
+        holonomy_min_plaquettes=ctx.get("holonomy_min_plaquettes", 2),
+        mem_budget_bytes=ctx.get("mem_budget_bytes"),
     )
 
 
@@ -111,8 +108,8 @@ def run_degenrotation(
     logger.header()
 
     initial_band = m.initial_band
-    final_band   = m.final_band
-    band_range   = list(range(initial_band, final_band + 1))
+    final_band = m.final_band
+    band_range = list(range(initial_band, final_band + 1))
 
     # ------------------------------------------------------------------
     # Log run parameters
@@ -134,8 +131,11 @@ def run_degenrotation(
     logger.info(f"\tIn-memory wfc cache: {use_wfc_cache}")
     logger.info(
         f"\tParallelism: n_workers={n_workers}"
-        + (" (Jacobi sweep within a zone; zone-level parallelism when >1 same-sig zone exists)"
-           if n_workers > 1 else " (serial Gauss-Seidel)")
+        + (
+            " (Jacobi sweep within a zone; zone-level parallelism when >1 same-sig zone exists)"
+            if n_workers > 1
+            else " (serial Gauss-Seidel)"
+        )
     )
     logger.info()
 
@@ -146,9 +146,9 @@ def run_degenrotation(
     # taken directly between them, so phase.npy is no longer loaded.
     # d_phase=None is threaded through to keep the rotation_core signatures
     # unchanged.
-    d_phase    = None
-    eigenvalues = d.eigenvalues                                     # shape (nks, nbnd)
-    neighbors   = d.neighbors                                       # shape (nks, 2*dimensions)
+    d_phase = None
+    eigenvalues = d.eigenvalues  # shape (nks, nbnd)
+    neighbors = d.neighbors  # shape (nks, 2*dimensions)
 
     logger.info(f"\tEigenvalues loaded, shape: {eigenvalues.shape}")
     logger.info()
@@ -211,28 +211,30 @@ def run_degenrotation(
     logger.info("\t****  Phases 3 & 4: Reference selection and BFS rotation propagation  ****")
 
     # Populate the shared context so fork-based workers inherit it.
-    _zone_ctx.update({
-        'd_phase':               d_phase,
-        'eigenvalues':           eigenvalues,
-        'neighbors':             neighbors,
-        'noncolin':              m.noncolin,
-        'wfcdir':                m.wfcdirectory,
-        'nr':                    m.nr,
-        'n_dir':                 2 * m.dimensions,
-        'compress':              compress,
-        'ethr':                  ethr,
-        'max_refinement_iter':   max_refinement_iter,
-        'refinement_iter_cap':   refinement_iter_cap,
-        'refinement_anderson_m': refinement_anderson_m,
-        'refinement_tol':        refinement_tol,
-        'holonomy_correction':      holonomy_correction,
-        'holonomy_max_iter':        holonomy_max_iter,
-        'holonomy_tol':             holonomy_tol,
-        'holonomy_min_plaquettes':  holonomy_min_plaquettes,
-        'use_wfc_cache':            use_wfc_cache,
-        'logger_name':           logger_name,
-        'logger_level':          logger_level,
-    })
+    _zone_ctx.update(
+        {
+            "d_phase": d_phase,
+            "eigenvalues": eigenvalues,
+            "neighbors": neighbors,
+            "noncolin": m.noncolin,
+            "wfcdir": m.wfcdirectory,
+            "nr": m.nr,
+            "n_dir": 2 * m.dimensions,
+            "compress": compress,
+            "ethr": ethr,
+            "max_refinement_iter": max_refinement_iter,
+            "refinement_iter_cap": refinement_iter_cap,
+            "refinement_anderson_m": refinement_anderson_m,
+            "refinement_tol": refinement_tol,
+            "holonomy_correction": holonomy_correction,
+            "holonomy_max_iter": holonomy_max_iter,
+            "holonomy_tol": holonomy_tol,
+            "holonomy_min_plaquettes": holonomy_min_plaquettes,
+            "use_wfc_cache": use_wfc_cache,
+            "logger_name": logger_name,
+            "logger_level": logger_level,
+        }
+    )
 
     # Group consecutive zones by signature.  Same-signature zones have
     # disjoint k-point sets (guaranteed by BFS in Phase 2) and can run
@@ -245,9 +247,9 @@ def run_degenrotation(
         else:
             zone_groups.append((sig, [(zi, zone)]))
 
-    # Check for fork availability once 
+    # Check for fork availability once
     try:
-        _fork_ctx = mp.get_context('fork')
+        _fork_ctx = mp.get_context("fork")
     except ValueError:
         _fork_ctx = None
         if n_workers > 1:
@@ -263,15 +265,12 @@ def run_degenrotation(
             _n_zones = len(_sig_zone_list)
             if _n_zones > 1 and n_workers > 1 and _fork_ctx is not None:
                 _n_pool = min(n_workers, _n_zones)
-                logger.info(
-                    f"\t  [Parallel zones] bands {sorted(_sig)}: "
-                    f"{_n_zones} zone(s) → {_n_pool} worker(s)"
-                )
+                logger.info(f"\t  [Parallel zones] bands {sorted(_sig)}: {_n_zones} zone(s) → {_n_pool} worker(s)")
                 # Split the RAM budget across the pool: each worker sizes its
                 # own wfc cache independently, and without a share they would
                 # all measure the same free memory and each claim it in full.
                 # Set before forking so children inherit the value.
-                _zone_ctx['mem_budget_bytes'] = _available_memory_bytes() // _n_pool
+                _zone_ctx["mem_budget_bytes"] = _available_memory_bytes() // _n_pool
                 _args = [(_zi, _sig, _zone) for _zi, _zone in _sig_zone_list]
                 with ProcessPoolExecutor(max_workers=_n_pool, mp_context=_fork_ctx) as _ex:
                     for _zone_rows in _ex.map(_process_zone_worker, _args):
@@ -279,10 +278,18 @@ def run_degenrotation(
             else:
                 for _zi, _zone in _sig_zone_list:
                     _rows = _process_zone(
-                        zi=_zi, sig=_sig, zone=_zone,
-                        d_phase=d_phase, eigenvalues=eigenvalues, neighbors=neighbors,
-                        noncolin=m.noncolin, wfcdir=m.wfcdirectory, nr=m.nr,
-                        n_dir=2 * m.dimensions, compress=compress, ethr=ethr,
+                        zi=_zi,
+                        sig=_sig,
+                        zone=_zone,
+                        d_phase=d_phase,
+                        eigenvalues=eigenvalues,
+                        neighbors=neighbors,
+                        noncolin=m.noncolin,
+                        wfcdir=m.wfcdirectory,
+                        nr=m.nr,
+                        n_dir=2 * m.dimensions,
+                        compress=compress,
+                        ethr=ethr,
                         max_refinement_iter=max_refinement_iter,
                         refinement_iter_cap=refinement_iter_cap,
                         refinement_anderson_m=refinement_anderson_m,
@@ -328,7 +335,7 @@ def run_degenrotation(
     # Save degenzones.npy — each row: [zone_id, b1 ... bN (−1 padded), k-point]
     # Uses zone_set from position 8 of each summary row so splits are reflected.
     if summary_rows:
-        max_n   = max(len(bands) for _, bands, *_ in summary_rows)
+        max_n = max(len(bands) for _, bands, *_ in summary_rows)
         records = []
         for zi, bands, _, _, _, _, _, _, zone_set, *_ in summary_rows:
             bs = list(bands) + [-1] * (max_n - len(bands))

@@ -5,6 +5,7 @@ help:
 	@echo ""
 	@echo "Development:"
 	@echo "  make setup       - Create the development environment with uv"
+	@echo "  make clean_setup - Clean generated files, then create the development environment"
 	@echo "  make install     - Install runtime dependencies"
 	@echo "  make test        - Run pytest with coverage and parallel workers"
 	@echo "  make lint        - Check code with Ruff"
@@ -17,6 +18,8 @@ help:
 
 setup:
 	uv sync --group dev
+
+clean_setup: clean setup
 
 install:
 	uv sync
@@ -49,4 +52,4 @@ clean:
 	find berry -type f -name "*.pyc" -delete
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov build dist
 
-.PHONY: help setup install pre-commit test lint format format-check typecheck quality build clean
+.PHONY: help setup clean_setup install pre-commit test lint format format-check typecheck quality build clean

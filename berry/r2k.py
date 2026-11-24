@@ -1,13 +1,12 @@
-from multiprocessing import Pool, Array
-
-import os
-from time import time
 import ctypes
 import logging
-
-from findiff import Gradient
+import os
+from multiprocessing import Array
+from multiprocessing import Pool
+from time import time
 
 import numpy as np
+from findiff import Gradient
 
 from berry import log
 
@@ -36,25 +35,25 @@ def read_wfc_files(banda: int, npr: int) -> None:
         b = bandsfinal[kp, banda] + initial_band
 
         if m.noncolin:
-            infile0  = f"{m.wfcdirectory}/k0{kp}b0{b}-0.wfc"
-            infile1  = f"{m.wfcdirectory}/k0{kp}b0{b}-1.wfc"
+            infile0 = f"{m.wfcdirectory}/k0{kp}b0{b}-0.wfc"
+            infile1 = f"{m.wfcdirectory}/k0{kp}b0{b}-1.wfc"
             tmp = np.load(infile0)
-            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
-                wfct_k0[:, kp] = tmp['arr_0']
+            if isinstance(tmp, np.lib.npyio.NpzFile):  # check if is npz file, which is can compressed
+                wfct_k0[:, kp] = tmp["arr_0"]
             else:
                 wfct_k0[:, kp] = tmp
 
             tmp = np.load(infile1)
-            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
-                wfct_k1[:, kp] = tmp['arr_0']
+            if isinstance(tmp, np.lib.npyio.NpzFile):  # check if is npz file, which is can compressed
+                wfct_k1[:, kp] = tmp["arr_0"]
             else:
                 wfct_k1[:, kp] = tmp
         else:
             infile = f"{m.wfcdirectory}/k0{kp}b0{b}.wfc"
 
             tmp = np.load(infile)
-            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
-                wfct_k[:, kp] = tmp['arr_0']
+            if isinstance(tmp, np.lib.npyio.NpzFile):  # check if is npz file, which is can compressed
+                wfct_k[:, kp] = tmp["arr_0"]
             else:
                 wfct_k[:, kp] = tmp
 
@@ -63,10 +62,12 @@ def read_wfc_files(banda: int, npr: int) -> None:
         b_true = banda + initial_band
         preview = missing.tolist() if missing.size <= 50 else missing[:50].tolist() + ["..."]
         # zero-filled here; interpolate_wfcpos() replaces these before the gradient and warns.
-        logger.debug(f"\tband {b_true}: {missing.size}/{m.nks} k-point(s) unattributed (-1) in bandsfinal; "
-                     f"zero-filling, to be interpolated before gradient: {preview}")
+        logger.debug(
+            f"\tband {b_true}: {missing.size}/{m.nks} k-point(s) unattributed (-1) in bandsfinal; "
+            f"zero-filling, to be interpolated before gradient: {preview}"
+        )
 
-    with Pool(min(10, npr)) as pool: #TODO: try to abstract this operation
+    with Pool(min(10, npr)) as pool:  # TODO: try to abstract this operation
         pool.map(read_wfc_kp, range(m.nks))
 
 
@@ -79,6 +80,7 @@ def calculate_wfcpos(npr: int) -> np.ndarray:
     """
     global calculate_wfcpos_kp
     if m.dimensions == 1:
+
         def calculate_wfcpos_kp(kp):
             if m.noncolin:
                 wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, 0, 0]]
@@ -90,6 +92,7 @@ def calculate_wfcpos(npr: int) -> np.ndarray:
             pool.map(calculate_wfcpos_kp, range(m.nr))
 
     elif m.dimensions == 2:
+
         def calculate_wfcpos_kp(kp):
             if m.noncolin:
                 wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, :, 0]]
@@ -101,6 +104,7 @@ def calculate_wfcpos(npr: int) -> np.ndarray:
             pool.map(calculate_wfcpos_kp, range(m.nr))
 
     else:
+
         def calculate_wfcpos_kp(kp):
             if m.noncolin:
                 wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, :, :]]
@@ -144,9 +148,12 @@ def interpolate_wfcpos(banda: int) -> None:
     targets = (wfcpos0, wfcpos1) if m.noncolin else (wfcpos,)  # last m.dimensions axes = k-mesh
     n_interp = n_orphan = 0
     for kp in bad_kps:
-        ij = tuple(int(x) for x in d.nktoijl[kp][:m.dimensions])
-        neigh = [tuple(int(x) for x in d.nktoijl[nb][:m.dimensions])
-                 for nb in d.neighbors[kp] if nb >= 0 and int(nb) not in bad_set]
+        ij = tuple(int(x) for x in d.nktoijl[kp][: m.dimensions])
+        neigh = [
+            tuple(int(x) for x in d.nktoijl[nb][: m.dimensions])
+            for nb in d.neighbors[kp]
+            if nb >= 0 and int(nb) not in bad_set
+        ]
         if not neigh:
             n_orphan += 1
             continue
@@ -155,27 +162,29 @@ def interpolate_wfcpos(banda: int) -> None:
         n_interp += 1
 
     b_true = banda + initial_band
-    msg = (f"\tband {b_true}: {bad_kps.size} unattributed (-1) k-point(s); "
-           f"interpolated wfcpos from BZ neighbours before gradient")
+    msg = (
+        f"\tband {b_true}: {bad_kps.size} unattributed (-1) k-point(s); "
+        f"interpolated wfcpos from BZ neighbours before gradient"
+    )
     if n_orphan:
         msg += f" ({n_orphan} left zero -- no attributed neighbour)"
     logger.warning(msg)
 
 
 def r_to_k(banda: int, npr: int, compress: bool, save_gra: bool) -> None:
-    b = banda + initial_band # true band
+    b = banda + initial_band  # true band
 
     need_pos = b not in bands_pos
     # wfcgra is only written on request (-savegra): geometry applies the same
     # findiff gradient on the fly while streaming wfcpos, so the files are
-    # redundant 
+    # redundant
     need_gra = save_gra and b not in bands_gra
     if not need_pos and not need_gra:
         logger.debug(f"\tband {b} already saved, skipping")
         return
 
     # the buffers hold nothing usable on entry (fresh process on resume, or a
-    # previous band), so wfcpos must be rebuilt whenever anything is written. 
+    # previous band), so wfcpos must be rebuilt whenever anything is written.
     start = time()
     read_wfc_files(banda, npr)
     logger.debug(f"\twfc files read in {time() - start:.2f} seconds")
@@ -191,7 +200,7 @@ def r_to_k(banda: int, npr: int, compress: bool, save_gra: bool) -> None:
         logger.info(f"\twfcgra{b} calculated in {time() - start:.2f} seconds")
 
     start = time()
-    #IDEA: Try saving this files into a folder in different chunks
+    # IDEA: Try saving this files into a folder in different chunks
     save = np.savez_compressed if compress else np.save
     ext = "npz" if compress else "npy"
     if m.noncolin:
@@ -213,38 +222,60 @@ def r_to_k(banda: int, npr: int, compress: bool, save_gra: bool) -> None:
 
     logger.debug(f"\twfcpos{b}{f' and wfcgra{b}' if need_gra else ''} saved in {time() - start:.2f} seconds\n")
 
+
 def save_r2k(bpos, bgra):
     # saving the bands already done
     bpos = list(map(lambda x: str(x), bpos))
     bgra = list(map(lambda x: str(x), bgra))
 
-    with open(os.path.join(m.workdir, save_file), 'w') as f:
-        f.write(' '.join(["bands_pos"] + bpos) + "\n")
-        f.write(' '.join(["bands_gra"] + bgra) + "\n")
+    with open(os.path.join(m.workdir, save_file), "w") as f:
+        f.write(" ".join(["bands_pos"] + bpos) + "\n")
+        f.write(" ".join(["bands_gra"] + bgra) + "\n")
 
 
-
-def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "r2k", logger_level: int = logging.INFO, compress: bool = False, flush: bool = False, save_gra: bool = False):
+def run_r2k(
+    max_band: int,
+    npr: int = 1,
+    min_band: int = 0,
+    logger_name: str = "r2k",
+    logger_level: int = logging.INFO,
+    compress: bool = False,
+    flush: bool = False,
+    save_gra: bool = False,
+):
     if m.noncolin:
-        global grad, bandsfinal, wfct_k0, wfct_k1, wfcpos0, wfcpos1, wfcgra0, wfcgra1, logger, initial_band, save_file, bands_pos, bands_gra
+        global \
+            grad, \
+            bandsfinal, \
+            wfct_k0, \
+            wfct_k1, \
+            wfcpos0, \
+            wfcpos1, \
+            wfcgra0, \
+            wfcgra1, \
+            logger, \
+            initial_band, \
+            save_file, \
+            bands_pos, \
+            bands_gra
     else:
         global grad, bandsfinal, wfct_k, wfcpos, wfcgra, logger, initial_band, save_file, bands_pos, bands_gra
 
-    initial_band = m.initial_band if m.initial_band != "dummy" else 0 # for backward compatibility
+    initial_band = m.initial_band if m.initial_band != "dummy" else 0  # for backward compatibility
 
     # current program state file
-    save_file = ".r2k.save" # file name
-    saved = False           # existing file
+    save_file = ".r2k.save"  # file name
+    saved = False  # existing file
     bands_pos = []
     bands_gra = []
     # reading save file
     if os.path.exists(os.path.join(m.workdir, save_file)):
-        with open(os.path.join(m.workdir, save_file), 'r') as f:
+        with open(os.path.join(m.workdir, save_file)) as f:
             lines = f.readlines()
         for line in lines:
             ii = line.split()
             if ii[0] == "bands_pos":
-                bands_pos = list(map(lambda x: int(x),ii[1:]))
+                bands_pos = list(map(lambda x: int(x), ii[1:]))
                 saved = True
             if ii[0] == "bands_gra":
                 bands_gra = list(map(lambda x: int(x), ii[1:]))
@@ -256,7 +287,7 @@ def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "
 
     ###########################################################################
     # 1. DEFINING THE CONSTANTS
-    ########################################################################### 
+    ###########################################################################
 
     WFCT_K_SHAPE = (m.nr, m.nks)
     if m.dimensions == 1:
@@ -275,7 +306,7 @@ def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "
 
     ###########################################################################
     # 2. STDOUT THE PARAMETERS
-    ########################################################################### 
+    ###########################################################################
     logger.info(f"\tUnique reference of run: {m.refname}")
     logger.info(f"\tNumber of processors to use: {npr}")
     logger.info(f"\tMinimum band: {min_band}")
@@ -293,17 +324,17 @@ def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "
     ###########################################################################
     # 3. CREATE ALL THE ARRAYS AND GRADIENT
     ###########################################################################
-    if m.dimensions == 1:                   # Defines gradient function in 1, 2 and 3D
+    if m.dimensions == 1:  # Defines gradient function in 1, 2 and 3D
         grad = Gradient(h=[m.step], acc=2)
     elif m.dimensions == 2:
-        grad = Gradient(h=[m.step, m.step], acc=2) 
+        grad = Gradient(h=[m.step, m.step], acc=2)
     else:
         grad = Gradient(h=[m.step, m.step, m.step], acc=2)
 
     # u-convention: phase.npy is intentionally NOT loaded -- wfcpos holds the
     # periodic parts u_nk directly (see calculate_wfcpos docstring).
     bandsfinal = np.load(os.path.join(m.data_dir, "bandsfinal.npy"))
-    logger.info(f"\tSignal and bands files loaded")
+    logger.info("\tSignal and bands files loaded")
 
     if m.noncolin:
         # NOTE: each array needs its own buffer.
@@ -334,14 +365,13 @@ def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "
             buffer = Array(ctypes.c_double, 2 * WFCGRA_SIZE, lock=False)
             wfcgra = np.frombuffer(buffer, dtype=np.complex128).reshape(WFCGRA_SHAPE)
 
-
     ###########################################################################
     # 4. CALCULATE
     ###########################################################################
     try:
         for banda in range(min_band - initial_band, max_band - initial_band + 1):
             r_to_k(banda, npr, compress, save_gra)
-            save_r2k(bands_pos, bands_gra) # saving the current state of the execution
+            save_r2k(bands_pos, bands_gra)  # saving the current state of the execution
     except Exception as err:
         save_r2k(bands_pos, bands_gra)
         raise err
@@ -353,8 +383,6 @@ def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "
         os.remove(os.path.join(m.workdir, save_file))
     logger.footer()
 
+
 if __name__ == "__main__":
     run_r2k(9, log("r2k", "R2K", "version", logging.DEBUG), 20)
-
-
-    

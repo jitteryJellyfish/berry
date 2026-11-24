@@ -1,33 +1,39 @@
-from multiprocessing import Pool, Array
-from itertools import product
-from typing import Dict, Tuple, Sequence
-
-import os, sys
 import ctypes
 import logging
-
-from findiff import Gradient
+import os
+import sys
+from collections.abc import Sequence
+from itertools import product
+from multiprocessing import Array
+from multiprocessing import Pool
 
 import numpy as np
+from findiff import Gradient
 
 from berry import log
-from berry._subroutines.comutator import comute, comute3, comutederiv
+from berry._subroutines.comutator import comute
+from berry._subroutines.comutator import comute3
+from berry._subroutines.comutator import comutederiv
 
 try:
     import berry._subroutines.loaddata as d
     import berry._subroutines.loadmeta as m
-except (ImportError, FileNotFoundError):
+except ImportError, FileNotFoundError:
     # data files not created yet (e.g. running the CLI help before preprocessing)
     pass
 
 
-def load_berry_connections(initial_band: int, conduction_band: int, berry_conn_size: int, berry_conn_shape: Tuple[Sequence[int]]) -> np.ndarray:
+def load_berry_connections(
+    initial_band: int, conduction_band: int, berry_conn_size: int, berry_conn_shape: tuple[Sequence[int]]
+) -> np.ndarray:
     base = Array(ctypes.c_double, berry_conn_size * 2, lock=False)
     berry_connections = np.frombuffer(base, dtype=np.complex128).reshape(berry_conn_shape)
 
     for i in range(initial_band, conduction_band + 1):
         for j in range(initial_band, conduction_band + 1):
-            berry_connections[i - initial_band, j - initial_band] = np.load(os.path.join(m.geometry_dir, f"berryConn{i}_{j}.npy"))
+            berry_connections[i - initial_band, j - initial_band] = np.load(
+                os.path.join(m.geometry_dir, f"berryConn{i}_{j}.npy")
+            )
 
     return berry_connections
 
@@ -41,8 +47,8 @@ def _interpolate_bad_eigenvalues(eigen_array: np.ndarray, bandsfinal: np.ndarray
     Iterative: each pass fills slots that now have at least one non-NaN same-band neighbour,
     so the fix propagates inward through a clustered bad region. A slot still unreachable when
     propagation stalls (an entire band island with no attributed anchor) is set to 0."""
-    band0 = initial_band - m.initial_band        # first bandsfinal column of the band window
-    bad = bandsfinal[:, band0:band0 + number_of_bands] < 0
+    band0 = initial_band - m.initial_band  # first bandsfinal column of the band window
+    bad = bandsfinal[:, band0 : band0 + number_of_bands] < 0
     if not bad.any():
         return
     n_bad = int(bad.sum())
@@ -54,20 +60,25 @@ def _interpolate_bad_eigenvalues(eigen_array: np.ndarray, bandsfinal: np.ndarray
         progress = False
         still = []
         for kp, banda in todo:
-            vals = [eigen_array[tuple(int(x) for x in d.nktoijl[nb][:m.dimensions]) + (banda,)]
-                    for nb in d.neighbors[kp] if nb >= 0]
+            vals = [
+                eigen_array[tuple(int(x) for x in d.nktoijl[nb][: m.dimensions]) + (banda,)]
+                for nb in d.neighbors[kp]
+                if nb >= 0
+            ]
             vals = [v for v in vals if not np.isnan(v)]
             if vals:
-                eigen_array[tuple(int(x) for x in d.nktoijl[kp][:m.dimensions]) + (banda,)] = np.mean(vals)
+                eigen_array[tuple(int(x) for x in d.nktoijl[kp][: m.dimensions]) + (banda,)] = np.mean(vals)
                 n_interp += 1
                 progress = True
             else:
                 still.append((kp, banda))
         todo = still
-    for kp, banda in todo:                       # unreachable slots: no anchor anywhere
-        eigen_array[tuple(int(x) for x in d.nktoijl[kp][:m.dimensions]) + (banda,)] = 0.0
-    msg = (f"\t{n_bad} unattributed (-1) eigenvalue slot(s) over "
-           f"{len(set(bad_kp.tolist()))} k-point(s); interpolated {n_interp} from BZ neighbours")
+    for kp, banda in todo:  # unreachable slots: no anchor anywhere
+        eigen_array[tuple(int(x) for x in d.nktoijl[kp][: m.dimensions]) + (banda,)] = 0.0
+    msg = (
+        f"\t{n_bad} unattributed (-1) eigenvalue slot(s) over "
+        f"{len(set(bad_kp.tolist()))} k-point(s); interpolated {n_interp} from BZ neighbours"
+    )
     if todo:
         msg += f", set {len(todo)} to 0 (no resolvable neighbour)"
     logger.warning(msg)
@@ -75,15 +86,17 @@ def _interpolate_bad_eigenvalues(eigen_array: np.ndarray, bandsfinal: np.ndarray
 
 def correct_eigenvalues(bandsfinal: np.ndarray, logger) -> np.ndarray:
     kp = 0
-    eigenvalues = d.eigenvalues[:, m.initial_band:] # align to the bandsfinal band numbering
+    eigenvalues = d.eigenvalues[:, m.initial_band :]  # align to the bandsfinal band numbering
     # bandsfinal columns are 0-based from m.initial_band; the script's band window starts
     # at initial_band (-mb), which may be higher, so offset the column lookup accordingly.
     band0 = initial_band - m.initial_band
+
     # bandsfinal == -1 marks k-points cluster0 could not attribute; index with NaN here (a raw
     # -1 would silently read the last band) and interpolate from neighbours afterwards.
     def energy(kp, banda):
         bf = bandsfinal[kp, band0 + banda]
         return np.nan if bf < 0 else eigenvalues[kp, bf]
+
     if m.dimensions == 1:
         eigen_array = np.zeros((m.nkx, number_of_bands))
         for i in range(m.nkx):
@@ -111,7 +124,9 @@ def correct_eigenvalues(bandsfinal: np.ndarray, logger) -> np.ndarray:
     return eigen_array
 
 
-def get_fermi_delta_ea_grad_ea(grad: Gradient, eigen_array: np.ndarray, conduction_band: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def get_fermi_delta_ea_grad_ea(
+    grad: Gradient, eigen_array: np.ndarray, conduction_band: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     grad_dea = np.zeros((m.dimensions,) + KSHAPE + (conduction_band + 1, conduction_band + 1), dtype=np.complex128)
     delta_ea = np.zeros(KSHAPE + (conduction_band + 1, conduction_band + 1))
     fermi = np.zeros(KSHAPE + (conduction_band + 1, conduction_band + 1))
@@ -127,7 +142,7 @@ def get_fermi_delta_ea_grad_ea(grad: Gradient, eigen_array: np.ndarray, conducti
     return fermi, delta_ea, grad_dea
 
 
-def precompute_comutederiv_sym(fermi: np.ndarray, logger) -> Dict[Tuple[int, int], np.ndarray]:
+def precompute_comutederiv_sym(fermi: np.ndarray, logger) -> dict[tuple[int, int], np.ndarray]:
     """The generalized-derivative commutator [xi^beta_{s's}, (xi^alpha1_{ss'})_;alpha2]
     does not depend on the photon energy, so it is computed once here instead of at
     every omega.  It is stored already symmetrized in alpha1 <-> alpha2, as required
@@ -146,36 +161,38 @@ def precompute_comutederiv_sym(fermi: np.ndarray, logger) -> Dict[Tuple[int, int
             )
         sym[(s, sprime)] = arr
     if sym:
-        size_mb = sum(a.nbytes for a in sym.values()) / 2 ** 20
-        logger.info(f"\tPrecomputed symmetrized generalized-derivative commutators for {len(sym)} band pairs ({size_mb:.0f} MB)")
+        size_mb = sum(a.nbytes for a in sym.values()) / 2**20
+        logger.info(
+            f"\tPrecomputed symmetrized generalized-derivative commutators for {len(sym)} band pairs ({size_mb:.0f} MB)"
+        )
     return sym
 
 
-def calculate_shg(omega: float, broadening: complex) -> Tuple[float, np.ndarray]:
+def calculate_shg(omega: float, broadening: complex) -> tuple[float, np.ndarray]:
 
-    omega_ = omega + broadening                                                  # hslash*omega + i*Gamma, in Ry
+    omega_ = omega + broadening  # hslash*omega + i*Gamma, in Ry
 
-    gamma1 = CONST * delta_ea / (2 * omega_ - delta_ea)                          # factor dE/g in paper times leading constant
-    gamma2 = -fermi / np.square(omega_ - delta_ea)                               # factor f/h^2 in paper (-) to account for change in indices in f and h
-    gamma3 = -fermi / (omega_ - delta_ea)                                        # factor f/h in paper (index reference is of h, not f, in equation)
+    gamma1 = CONST * delta_ea / (2 * omega_ - delta_ea)  # factor dE/g in paper times leading constant
+    gamma2 = -fermi / np.square(
+        omega_ - delta_ea
+    )  # factor f/h^2 in paper (-) to account for change in indices in f and h
+    gamma3 = -fermi / (omega_ - delta_ea)  # factor f/h in paper (index reference is of h, not f, in equation)
     gamma12 = gamma1 * gamma2
     gamma13 = gamma1 * gamma3
 
-    sig = np.zeros(KSHAPE + (m.dimensions,) * 3, dtype=np.complex128)            # tensor sig_xxx, sig_xxy, ..., sig_yyy
+    sig = np.zeros(KSHAPE + (m.dimensions,) * 3, dtype=np.complex128)  # tensor sig_xxx, sig_xxy, ..., sig_yyy
 
     # beta, alpha1, alpha2 are spatial coordinates
     for beta, alpha1, alpha2 in product(range(m.dimensions), repeat=3):
-        for s, sprime in product(band_list, repeat=2):                           # runs through band indices s, s'
+        for s, sprime in product(band_list, repeat=2):  # runs through band indices s, s'
             if s == sprime:
                 continue
 
             # term with the gradient of the energy differences ((alpha1 <-> alpha2)-symmetrized)
             sig[..., beta, alpha1, alpha2] += (
                 (
-                    grad_dea[alpha2][..., s, sprime]
-                    * comute(berry_connections, sprime, s, beta, alpha1)
-                    + grad_dea[alpha1][..., s, sprime]
-                    * comute(berry_connections, sprime, s, beta, alpha2)
+                    grad_dea[alpha2][..., s, sprime] * comute(berry_connections, sprime, s, beta, alpha1)
+                    + grad_dea[alpha1][..., s, sprime] * comute(berry_connections, sprime, s, beta, alpha2)
                 )
                 * gamma12[..., s, sprime]
                 * 0.5
@@ -189,7 +206,7 @@ def calculate_shg(omega: float, broadening: complex) -> Tuple[float, np.ndarray]
 
             # three-band term; after the (alpha1 <-> alpha2) symmetrization the same
             # pair of comute3 products multiplies both occupation factors
-            for r in band_list:                                                  # runs through band index r
+            for r in band_list:  # runs through band index r
                 if r in (sprime, s):
                     continue
                 sig[..., beta, alpha1, alpha2] += (
@@ -205,8 +222,30 @@ def calculate_shg(omega: float, broadening: complex) -> Tuple[float, np.ndarray]
     return omega, np.sum(sig, axis=tuple(range(m.dimensions))) * VK * UNIT
 
 
-def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: float = 2.5, energy_step: float = 0.001, brd: float = 0.01, logger_name: str = "shg", logger_level: int = logging.INFO, flush: bool = False):
-    global fermi, delta_ea, grad_dea, comutederiv_sym, band_list, berry_connections, KSHAPE, CONST, VK, UNIT, initial_band, number_of_bands
+def run_shg(
+    conduction_band: int,
+    min_band: int = 0,
+    npr: int = 1,
+    energy_max: float = 2.5,
+    energy_step: float = 0.001,
+    brd: float = 0.01,
+    logger_name: str = "shg",
+    logger_level: int = logging.INFO,
+    flush: bool = False,
+):
+    global \
+        fermi, \
+        delta_ea, \
+        grad_dea, \
+        comutederiv_sym, \
+        band_list, \
+        berry_connections, \
+        KSHAPE, \
+        CONST, \
+        VK, \
+        UNIT, \
+        initial_band, \
+        number_of_bands
     logger = log(logger_name, "SECOND HARMONIC GENERATOR", level=logger_level, flush=flush)
 
     logger.header()
@@ -227,16 +266,16 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
     ###########################################################################
     # 1. DEFINING THE CONSTANTS
     ###########################################################################
-    RY    = 13.6056923                                                          # Conversion factor from Ry to eV
-    VK    = m.step ** m.dimensions                                              # element of volume in k-space (grid units);
-                                                                                # the 1/(2pi)^d of the BZ integral is in CONST
+    RY = 13.6056923  # Conversion factor from Ry to eV
+    VK = m.step**m.dimensions  # element of volume in k-space (grid units);
+    # the 1/(2pi)^d of the BZ integral is in CONST
     # The k-point grid (and therefore berryConn, grad_dea and VK) is in QE 'tpiba' units,
     # 2pi/alat.  Each SHG term carries three inverse powers of k against the dk^d of the
     # k-sum, leaving d-3 powers of k; convert them to bohr^-1 so that sigma comes out in
     # bohr-based Rydberg atomic units (e^2 = 2, hslash = 1).
     # a1 is in bohr and b1 in 2pi/alat (QE xml conventions), so a1.b1 = alat exactly.
-    alat  = float(np.dot(m.a1, m.b1))                                           # lattice parameter (bohr)
-    UNIT  = (2 * np.pi / alat) ** (m.dimensions - 3)
+    alat = float(np.dot(m.a1, m.b1))  # lattice parameter (bohr)
+    UNIT = (2 * np.pi / alat) ** (m.dimensions - 3)
     # |e|^3/hslash 1/(2pi)^d in Rydberg units (e^2 = 2 so |e|^3 = 2*sqrt(2));
     # doubled for spin degeneracy unless this is a noncollinear calculation.
     # The -e^3 prefactor of the formula is positive with the signed electron charge e = -|e|.
@@ -245,10 +284,10 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
     else:
         CONST = 2 * 2 * np.sqrt(2) / (2 * np.pi) ** m.dimensions
 
-    band_list   = list(range(conduction_band + 1 - initial_band))
-    band_info   = list(range(initial_band, conduction_band + 1))
+    band_list = list(range(conduction_band + 1 - initial_band))
+    band_info = list(range(initial_band, conduction_band + 1))
 
-    #TODO: Add docstring with these comments
+    # TODO: Add docstring with these comments
     # Maximum energy (Ry)
     # Energy step (Ry)
     # energy broadening (Ry)
@@ -260,7 +299,7 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
         KSHAPE = (m.nkx, m.nky)
     else:
         KSHAPE = (m.nkx, m.nky, m.nkz)
-    berry_conn_size  = m.dimensions * cb ** 2 * int(np.prod(KSHAPE))
+    berry_conn_size = m.dimensions * cb**2 * int(np.prod(KSHAPE))
     berry_conn_shape = (cb, cb, m.dimensions) + KSHAPE
 
     ###########################################################################
@@ -271,16 +310,18 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
     logger.info(f"\n\tList of bands: {band_info}")
     logger.info(f"\tNumber of k-points in each direction: {m.nkx} {m.nky} {m.nkz}")
     logger.info(f"\tNumber of bands: {m.nbnd}")
-    logger.info(f"\tk-points step, dk {m.step} (2pi/alat units; alat = {alat:.6f} bohr)")     # Defines the step for gradient calculation dk
+    logger.info(
+        f"\tk-points step, dk {m.step} (2pi/alat units; alat = {alat:.6f} bohr)"
+    )  # Defines the step for gradient calculation dk
 
     logger.info(f"\n\tMaximum energy (Ry): {energy_max}")
     logger.info(f"\tEnergy step (Ry): {energy_step}")
     logger.info(f"\tEnergy broadening (Ry): {np.imag(broadening)}")
     if m.noncolin:
-        logger.info(f"\tThis is a noncollinear calculation.")
+        logger.info("\tThis is a noncollinear calculation.")
         logger.info(f"\tConstant e^3/hslash 1/(2pi)^d in Rydberg units: {np.real(CONST)}")
     else:
-        logger.info(f"\tThis is a no spin calculation.")
+        logger.info("\tThis is a no spin calculation.")
         logger.info(f"\tConstant 2e^3/hslash 1/(2pi)^d in Rydberg units: {np.real(CONST)}")
     logger.info(f"\tNumber of dimensions d = {m.dimensions}")
     logger.info(f"\tVolume (area) element in k space: {VK}; unit conversion to bohr: {UNIT}\n")
@@ -288,13 +329,13 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
     ###########################################################################
     # 3. CREATE ALL THE ARRAYS
     ###########################################################################
-    grad = Gradient(h=[m.step] * m.dimensions, acc=2)                            # Defines gradient function in m.dimensions dimensions
+    grad = Gradient(h=[m.step] * m.dimensions, acc=2)  # Defines gradient function in m.dimensions dimensions
 
-    bandsfinal                = np.load(os.path.join(m.data_dir, "bandsfinal.npy"))
-    eigen_array               = correct_eigenvalues(bandsfinal, logger)
-    berry_connections         = load_berry_connections(initial_band, conduction_band, berry_conn_size, berry_conn_shape)
+    bandsfinal = np.load(os.path.join(m.data_dir, "bandsfinal.npy"))
+    eigen_array = correct_eigenvalues(bandsfinal, logger)
+    berry_connections = load_berry_connections(initial_band, conduction_band, berry_conn_size, berry_conn_shape)
     fermi, delta_ea, grad_dea = get_fermi_delta_ea_grad_ea(grad, eigen_array, conduction_band - initial_band)
-    comutederiv_sym           = precompute_comutederiv_sym(fermi, logger)
+    comutederiv_sym = precompute_comutederiv_sym(fermi, logger)
 
     ###########################################################################
     # 4. SECOND HARMONIC GENERATION
@@ -316,14 +357,64 @@ def run_shg(conduction_band: int, min_band: int = 0, npr: int = 1, energy_max: f
         components = [(0, 0, 0), (1, 1, 1), (0, 0, 1), (0, 1, 0), (0, 1, 1), (1, 1, 0), (1, 0, 1), (1, 0, 0)]
         names = ["xxx", "yyy", "xxy", "xyx", "xyy", "yyx", "yxy", "yxx"]
     else:
-        components = [(0, 0, 0), (1, 1, 1), (2, 2, 2), (0, 0, 1), (0, 0, 2), (0, 1, 0), (0, 2, 0), (1, 0, 0),
-                      (2, 0, 0), (0, 1, 1), (2, 1, 1), (1, 1, 0), (1, 1, 2), (1, 0, 1), (1, 2, 1),
-                      (0, 2, 2), (1, 2, 2), (2, 2, 0), (2, 2, 1), (2, 0, 2), (2, 1, 2), (0, 1, 2),
-                      (2, 0, 1), (1, 2, 0), (0, 2, 1), (2, 1, 0), (1, 0, 2)]
-        names = ["xxx", "yyy", "zzz", "xxy", "xxz", "xyx", "xzx", "yxx",
-                 "zxx", "xyy", "zyy", "yyx", "yyz", "yxy", "yzy",
-                 "xzz", "yzz", "zzx", "zzy", "zxz", "zyz", "xyz",
-                 "zxy", "yzx", "xzy", "zyx", "yxz"]
+        components = [
+            (0, 0, 0),
+            (1, 1, 1),
+            (2, 2, 2),
+            (0, 0, 1),
+            (0, 0, 2),
+            (0, 1, 0),
+            (0, 2, 0),
+            (1, 0, 0),
+            (2, 0, 0),
+            (0, 1, 1),
+            (2, 1, 1),
+            (1, 1, 0),
+            (1, 1, 2),
+            (1, 0, 1),
+            (1, 2, 1),
+            (0, 2, 2),
+            (1, 2, 2),
+            (2, 2, 0),
+            (2, 2, 1),
+            (2, 0, 2),
+            (2, 1, 2),
+            (0, 1, 2),
+            (2, 0, 1),
+            (1, 2, 0),
+            (0, 2, 1),
+            (2, 1, 0),
+            (1, 0, 2),
+        ]
+        names = [
+            "xxx",
+            "yyy",
+            "zzz",
+            "xxy",
+            "xxz",
+            "xyx",
+            "xzx",
+            "yxx",
+            "zxx",
+            "xyy",
+            "zyy",
+            "yyx",
+            "yyz",
+            "yxy",
+            "yzy",
+            "xzz",
+            "yzz",
+            "zzx",
+            "zzy",
+            "zxz",
+            "zyz",
+            "xyz",
+            "zxy",
+            "yzx",
+            "xzy",
+            "zyx",
+            "yxz",
+        ]
     header = "# Energy (eV), " + ", ".join(f"sigma_{name}" for name in names)
     header += "  (sigma in Rydberg atomic units: e^2 = 2, hslash = 1, lengths in bohr)\n"
 

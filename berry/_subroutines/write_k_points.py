@@ -1,6 +1,7 @@
 """
-    This moldule writes in stdout the k-points in a useful layout
+This moldule writes in stdout the k-points in a useful layout
 """
+
 import numpy as np
 
 # pylint: disable=C0103
@@ -50,7 +51,8 @@ def _bands_numbers(nkx: int, nky: int, valuesarray: np.ndarray) -> str:
 
     return out
 
-def _float_numbers1(nkx: int, valuesarray: np.ndarray , precision: int) -> str:
+
+def _float_numbers1(nkx: int, valuesarray: np.ndarray, precision: int) -> str:
     """Outputs the valuesarray float numbers with the precision number of decimal places."""
     nk = -1
     SEP = " "
@@ -70,7 +72,8 @@ def _float_numbers1(nkx: int, valuesarray: np.ndarray , precision: int) -> str:
 
     return out
 
-def _float_numbers2(nkx: int, nky: int, valuesarray: np.ndarray , precision: int) -> str:
+
+def _float_numbers2(nkx: int, nky: int, valuesarray: np.ndarray, precision: int) -> str:
     """Outputs the valuesarray float numbers with the precision number of decimal places."""
     nk = -1
     SEP = " "
@@ -91,7 +94,8 @@ def _float_numbers2(nkx: int, nky: int, valuesarray: np.ndarray , precision: int
 
     return out
 
-def _float_numbers3(nkx: int, nky: int, nkz: int, valuesarray: np.ndarray , precision: int) -> str:
+
+def _float_numbers3(nkx: int, nky: int, nkz: int, valuesarray: np.ndarray, precision: int) -> str:
     """Outputs the valuesarray float numbers with the precision number of decimal places."""
     nk = -1
     SEP = " "

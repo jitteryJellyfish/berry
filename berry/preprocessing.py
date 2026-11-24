@@ -1,70 +1,72 @@
-from typing import Dict, Union, List, Tuple
-from multiprocessing import Pool
-from itertools import product
-
-import os
-import re
-import time
 import logging
+import os
 import platform
-import xml.etree.ElementTree as ET
+import re
 import subprocess
+import time
+import xml.etree.ElementTree as ET
+from itertools import product
+from multiprocessing import Pool
+from typing import Union
 
-import numpy as np # type: ignore
+import numpy as np  # type: ignore
 
-from berry import log, __version__
+from berry import __version__
+from berry import log
 from berry._subroutines.parserQE import parser
 
 # Time when the run starts, then used for reference to the run:
 now = time.strftime("%d-%m-%Y_%H:%M:%S", time.gmtime())
-Date = Dict[str, Union[int, str, float]]
+Date = dict[str, Union[int, str, float]]
+
 
 # This class initializes a berry run
 class Preprocess:
-    def __init__(self,
-                 k0: List[float],
-                 nkx: int,
-                 nky: int,
-                 nkz: int,
-                 step: float,
-                 nbnd: int,
-                 logger_name: str = "preprocess",
-                 logger_level: int = logging.INFO,
-                 npr: int = 1,
-                 dft_dir: str = "dft",
-                 scf: str = "scf.in",
-                 nscf: str = "",
-                 wfc_dir: str = "wfc",
-                 point: float = 1.178097,
-                 program: str = "QE",
-                 ref_name: str = now,
-                 kvector1: List[float] = None, # type: ignore
-                 kvector2: List[float] = None, # type: ignore
-                 kvector3: List[float] = None, # type: ignore
-                 wfcut: int = -1,
-                 flush: bool = False,
-                 z1: float = 0,
-                 Deltaz: float = 0,
-                 y1: float = 0,
-                 Deltay: float = 0
-                ):
+    def __init__(
+        self,
+        k0: list[float],
+        nkx: int,
+        nky: int,
+        nkz: int,
+        step: float,
+        nbnd: int,
+        logger_name: str = "preprocess",
+        logger_level: int = logging.INFO,
+        npr: int = 1,
+        dft_dir: str = "dft",
+        scf: str = "scf.in",
+        nscf: str = "",
+        wfc_dir: str = "wfc",
+        point: float = 1.178097,
+        program: str = "QE",
+        ref_name: str = now,
+        kvector1: list[float] = None,  # type: ignore
+        kvector2: list[float] = None,  # type: ignore
+        kvector3: list[float] = None,  # type: ignore
+        wfcut: int = -1,
+        flush: bool = False,
+        z1: float = 0,
+        Deltaz: float = 0,
+        y1: float = 0,
+        Deltay: float = 0,
+    ):
 
-        self.work_dir = os.getcwd() + "/"    # Define working directory
-        self.k0 = k0                         # Coordinates of first k-point in reciprocal space
-        self.nkx = nkx                       # Number of k-points in the x direction
-        self.nky = nky                       # Number of k-points in the y direction
-        self.nkz = nkz                       # Number of k-points in the z direction
-        self.step = step                     # Distance between k-points
-        self.z1 = z1                         # Cut in real space, direction z
-        self.y1 = y1                         # Cut in real space, direction y
-        self.Deltaz = Deltaz                 # Size of cut, direction z
-        self.Deltay = Deltay                 # Size of cut, direction y
+        self.work_dir = os.getcwd() + "/"  # Define working directory
+        self.k0 = k0  # Coordinates of first k-point in reciprocal space
+        self.nkx = nkx  # Number of k-points in the x direction
+        self.nky = nky  # Number of k-points in the y direction
+        self.nkz = nkz  # Number of k-points in the z direction
+        self.step = step  # Distance between k-points
+        self.z1 = z1  # Cut in real space, direction z
+        self.y1 = y1  # Cut in real space, direction y
+        self.Deltaz = Deltaz  # Size of cut, direction z
+        self.Deltay = Deltay  # Size of cut, direction y
 
         if int(wfcut) < 0:
             self.wfcut = -1
         else:
-            self.wfcut = wfcut               # Cutoff band: bands bellow are not included in the calculation (inclusive)
-                                             # wfcut = -1 means all bands are included
+            self.wfcut = wfcut  # Cutoff band: bands bellow are not included in the calculation (inclusive)
+            # wfcut = -1 means all bands are included
         if self.nkz < 1:
             self.nkz = 1
         if self.nky < 1:
@@ -72,42 +74,42 @@ class Preprocess:
         if self.nkx < 1:
             self.nkx = 1
         if kvector1 == None:
-            self.kvector1 = [1.0,0.0,0.0]
+            self.kvector1 = [1.0, 0.0, 0.0]
         else:
-            self.kvector1 = kvector1         # First vector for the volume in k-space
+            self.kvector1 = kvector1  # First vector for the volume in k-space
 
         if kvector2 == None:
-            self.kvector2 = [0.0,1.0,0.0]
+            self.kvector2 = [0.0, 1.0, 0.0]
         else:
-            self.kvector2 = kvector2         # Second vector for the volume in k-space
+            self.kvector2 = kvector2  # Second vector for the volume in k-space
 
         if kvector3 == None:
-            self.kvector3 = [0.0,0.0,1.0]
+            self.kvector3 = [0.0, 0.0, 1.0]
         else:
-            self.kvector3 = kvector3         # Third vector for the volume in k-space
+            self.kvector3 = kvector3  # Third vector for the volume in k-space
 
-        self.nbnd = nbnd                     # Number of bands to be included in the calculation
+        self.nbnd = nbnd  # Number of bands to be included in the calculation
 
-        self.dft_dir = dft_dir               # Directory where the DFT files go
-        self.scf = scf                       # Name of the scf DFT file to run
-        self.nscf = nscf                     # Name of the nscf DFT file to run
-        self.wfc_dir = wfc_dir               # Directory to save the wavefunctions
-        self.point = point                   # Reference to point where wavefunctions will be set to the same phase
-        self.program = program               # Name of the DFT software to be used
-        self.ref_name = ref_name             # Unique reference for the whole run
+        self.dft_dir = dft_dir  # Directory where the DFT files go
+        self.scf = scf  # Name of the scf DFT file to run
+        self.nscf = nscf  # Name of the nscf DFT file to run
+        self.wfc_dir = wfc_dir  # Directory to save the wavefunctions
+        self.point = point  # Reference to point where wavefunctions will be set to the same phase
+        self.program = program  # Name of the DFT software to be used
+        self.ref_name = ref_name  # Unique reference for the whole run
 
         if not os.path.exists("log"):
-            os.mkdir("log")                      # Creates log directory
+            os.mkdir("log")  # Creates log directory
         self.logger = log(logger_name, "PREPROCESS", level=logger_level, flush=flush)
         # Write header to the log file
         self.logger.header()
 
-        try:                                 # Tests if mpirun is in the system
+        try:  # Tests if mpirun is in the system
             b = subprocess.check_output("which mpirun", shell=True, text=True)
-            self.npr = npr                   # Number of processes to be run
-        except subprocess.CalledProcessError as e: # if not, runs in a single processor
-            self.npr = 1                     # Number of processes to be run
-            self.logger.info(f"\n\tNumber of processors changed to 1, since no mpirun was found.\n")
+            self.npr = npr  # Number of processes to be run
+        except subprocess.CalledProcessError:  # if not, runs in a single processor
+            self.npr = 1  # Number of processes to be run
+            self.logger.info("\n\tNumber of processors changed to 1, since no mpirun was found.\n")
 
         # Determine which axes actually carry more than one k-point
         x_active = self.nkx > 1
@@ -117,74 +119,96 @@ class Preprocess:
 
         # Verification of the vectors that define k-space that will be dealt with
         if num_active == 3:
-            self.dimensions = 3                  # Number of spatial dimensions of the material
-            if self.kvector1[0]*self.kvector2[0] + self.kvector1[1]*self.kvector2[1] + self.kvector1[2]*self.kvector2[2] != 0:
-                self.logger.info(f"\tVectors 1 and 2 that define the volume in reciprocal space have to be orthogonal.")
-                self.logger.info(f"\tExiting program.")
+            self.dimensions = 3  # Number of spatial dimensions of the material
+            if (
+                self.kvector1[0] * self.kvector2[0]
+                + self.kvector1[1] * self.kvector2[1]
+                + self.kvector1[2] * self.kvector2[2]
+                != 0
+            ):
+                self.logger.info("\tVectors 1 and 2 that define the volume in reciprocal space have to be orthogonal.")
+                self.logger.info("\tExiting program.")
                 self.logger.footer()
                 exit(0)
-            elif self.kvector1[0]*self.kvector3[0] + self.kvector1[1]*self.kvector3[1] + self.kvector1[2]*self.kvector3[2] != 0:
-                self.logger.info(f"\tVectors 1 and 3 that define the volume in reciprocal space have to be orthogonal.")
-                self.logger.info(f"\tExiting program.")
+            elif (
+                self.kvector1[0] * self.kvector3[0]
+                + self.kvector1[1] * self.kvector3[1]
+                + self.kvector1[2] * self.kvector3[2]
+                != 0
+            ):
+                self.logger.info("\tVectors 1 and 3 that define the volume in reciprocal space have to be orthogonal.")
+                self.logger.info("\tExiting program.")
                 self.logger.footer()
                 exit(0)
-            elif self.kvector2[0]*self.kvector3[0] + self.kvector2[1]*self.kvector3[1] + self.kvector2[2]*self.kvector3[2] != 0:
-                self.logger.info(f"\tVectors 2 and 3 that define the volume in reciprocal space have to be orthogonal.")
-                self.logger.info(f"\tExiting program.")
+            elif (
+                self.kvector2[0] * self.kvector3[0]
+                + self.kvector2[1] * self.kvector3[1]
+                + self.kvector2[2] * self.kvector3[2]
+                != 0
+            ):
+                self.logger.info("\tVectors 2 and 3 that define the volume in reciprocal space have to be orthogonal.")
+                self.logger.info("\tExiting program.")
                 self.logger.footer()
                 exit(0)
-            if self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2 != 1:
-                modulus_kvector1 = np.sqrt(self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2)
-                self.kvector1 = np.array(self.kvector1)/modulus_kvector1
-            if self.kvector2[0]**2 + self.kvector2[1]**2 + self.kvector2[2]**2 != 1:
-                modulus_kvector2 = np.sqrt(self.kvector2[0]**2 + self.kvector2[1]**2 + self.kvector2[2]**2)
-                self.kvector2 = np.array(self.kvector2)/modulus_kvector2
-            if self.kvector3[0]**2 + self.kvector3[1]**2 + self.kvector3[2]**2 != 1:
-                modulus_kvector3 = np.sqrt(self.kvector3[0]**2 + self.kvector3[1]**2 + self.kvector3[2]**2)
-                self.kvector3 = np.array(self.kvector3)/modulus_kvector3
+            if self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2 != 1:
+                modulus_kvector1 = np.sqrt(self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2)
+                self.kvector1 = np.array(self.kvector1) / modulus_kvector1
+            if self.kvector2[0] ** 2 + self.kvector2[1] ** 2 + self.kvector2[2] ** 2 != 1:
+                modulus_kvector2 = np.sqrt(self.kvector2[0] ** 2 + self.kvector2[1] ** 2 + self.kvector2[2] ** 2)
+                self.kvector2 = np.array(self.kvector2) / modulus_kvector2
+            if self.kvector3[0] ** 2 + self.kvector3[1] ** 2 + self.kvector3[2] ** 2 != 1:
+                modulus_kvector3 = np.sqrt(self.kvector3[0] ** 2 + self.kvector3[1] ** 2 + self.kvector3[2] ** 2)
+                self.kvector3 = np.array(self.kvector3) / modulus_kvector3
         elif num_active == 2:
             if not (x_active and y_active):
-                self.logger.error(f"\tA 2D material must lie in the xy plane: nkz must be 1, with nkx > 1 and nky > 1 "
-                                   f"(got nkx={self.nkx}, nky={self.nky}, nkz={self.nkz}).")
-                self.logger.error(f"\tExiting program.")
+                self.logger.error(
+                    f"\tA 2D material must lie in the xy plane: nkz must be 1, with nkx > 1 and nky > 1 "
+                    f"(got nkx={self.nkx}, nky={self.nky}, nkz={self.nkz})."
+                )
+                self.logger.error("\tExiting program.")
                 self.logger.footer()
                 exit(0)
             self.dimensions = 2
-            if self.kvector1[0]*self.kvector2[0] + self.kvector1[1]*self.kvector2[1] + self.kvector1[2]*self.kvector2[2] != 0:
-                self.logger.info(f"\tThe two vectors that define the area in reciprocal space have to be orthogonal.")
-                self.logger.info(f"\tExiting program.")
+            if (
+                self.kvector1[0] * self.kvector2[0]
+                + self.kvector1[1] * self.kvector2[1]
+                + self.kvector1[2] * self.kvector2[2]
+                != 0
+            ):
+                self.logger.info("\tThe two vectors that define the area in reciprocal space have to be orthogonal.")
+                self.logger.info("\tExiting program.")
                 self.logger.footer()
                 exit(0)
-            if self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2 != 1:
-                modulus_kvector1 = np.sqrt(self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2)
-                self.kvector1 = np.array(self.kvector1)/modulus_kvector1
-            if self.kvector2[0]**2 + self.kvector2[1]**2 + self.kvector2[2]**2 != 1:
-                modulus_kvector2 = np.sqrt(self.kvector2[0]**2 + self.kvector2[1]**2 + self.kvector2[2]**2)
-                self.kvector2 = np.array(self.kvector2)/modulus_kvector2
+            if self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2 != 1:
+                modulus_kvector1 = np.sqrt(self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2)
+                self.kvector1 = np.array(self.kvector1) / modulus_kvector1
+            if self.kvector2[0] ** 2 + self.kvector2[1] ** 2 + self.kvector2[2] ** 2 != 1:
+                modulus_kvector2 = np.sqrt(self.kvector2[0] ** 2 + self.kvector2[1] ** 2 + self.kvector2[2] ** 2)
+                self.kvector2 = np.array(self.kvector2) / modulus_kvector2
         elif num_active == 1:
             if not x_active:
-                self.logger.error(f"\tA 1D material must be aligned with the x axis: nky = nkz = 1, with nkx > 1 "
-                                   f"(got nkx={self.nkx}, nky={self.nky}, nkz={self.nkz}).")
-                self.logger.error(f"\tExiting program.")
+                self.logger.error(
+                    f"\tA 1D material must be aligned with the x axis: nky = nkz = 1, with nkx > 1 "
+                    f"(got nkx={self.nkx}, nky={self.nky}, nkz={self.nkz})."
+                )
+                self.logger.error("\tExiting program.")
                 self.logger.footer()
                 exit(0)
             self.dimensions = 1
-            if self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2 != 1:
-                modulus_kvector = np.sqrt(self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2)
-                self.kvector1 = np.array(self.kvector1)/modulus_kvector
-                #self.kvector2 = [0.0,1.0,0.0]
-                #self.kvector3 = [0.0,0.0,1.0]
+            if self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2 != 1:
+                modulus_kvector = np.sqrt(self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2)
+                self.kvector1 = np.array(self.kvector1) / modulus_kvector
+                # self.kvector2 = [0.0,1.0,0.0]
+                # self.kvector3 = [0.0,0.0,1.0]
         else:
             # num_active == 0: single k-point (Gamma-only)
             self.dimensions = 1
-            if self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2 != 1:
-                modulus_kvector = np.sqrt(self.kvector1[0]**2 + self.kvector1[1]**2 + self.kvector1[2]**2)
-                self.kvector1 = np.array(self.kvector1)/modulus_kvector
+            if self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2 != 1:
+                modulus_kvector = np.sqrt(self.kvector1[0] ** 2 + self.kvector1[1] ** 2 + self.kvector1[2] ** 2)
+                self.kvector1 = np.array(self.kvector1) / modulus_kvector
         # If it is 2D, use x and y directions
         # If it is 1D, use x direction
         # Only these possibilities are available
-
-
 
         # Full path to the log directory:
         self.log_dir = os.path.join(self.work_dir, "log")
@@ -204,8 +228,8 @@ class Preprocess:
         self.geometry_dir = os.path.join(self.data_dir, "geometry")
 
         # Correct scf's file names if necessary
-    #    if not self.scf.endswith(".in"):
-    #        self.scf += ".in"
+        #    if not self.scf.endswith(".in"):
+        #        self.scf += ".in"
         # Create variable for the name of the nscf file
         self.nscf = "n" + os.path.basename(self.scf)
 
@@ -213,12 +237,14 @@ class Preprocess:
         self.scf = os.path.join(self.dft_dir, self.scf)
         self.nscf = os.path.join(self.dft_dir, self.nscf)
 
-        if self.program == "QE":    # If the DFT program is QE (only option for now)
+        if self.program == "QE":  # If the DFT program is QE (only option for now)
             # Get outdir from scf
             try:
                 self.out_dir = parser("outdir", self.scf)
             except IndexError:
-                raise ValueError(f"outdir keyword not found in {self.scf}. Make sure your scf file has the 'outdir' keyword set to './'")
+                raise ValueError(
+                    f"outdir keyword not found in {self.scf}. Make sure your scf file has the 'outdir' keyword set to './'"
+                )
             if self.out_dir == "./out/":
                 self.out_dir = os.path.join("dft", self.out_dir)
             self.out_dir = os.path.abspath(self.out_dir)
@@ -227,7 +253,9 @@ class Preprocess:
             try:
                 self.pseudo_dir = parser("pseudo_dir", self.scf)
             except IndexError:
-                raise ValueError(f"pseudo_dir keyword not found in {self.scf}. Make sure your scf file has the 'pseudo_dir' keyword set.")
+                raise ValueError(
+                    f"pseudo_dir keyword not found in {self.scf}. Make sure your scf file has the 'pseudo_dir' keyword set."
+                )
             if self.pseudo_dir == "./":
                 self.pseudo_dir = os.path.join("dft", self.pseudo_dir)
             self.pseudo_dir = os.path.abspath(self.pseudo_dir)
@@ -236,14 +264,15 @@ class Preprocess:
             try:
                 self.prefix = parser("prefix", self.scf)
             except IndexError:
-                raise ValueError(f"prefix keyword not found in {self.scf}. Make sure your scf file has the 'prefix' keyword set.")
+                raise ValueError(
+                    f"prefix keyword not found in {self.scf}. Make sure your scf file has the 'prefix' keyword set."
+                )
 
         # Full path to xml DFT file, with the data of the run
         self.dft_data_file = os.path.join(self.out_dir, self.prefix + ".xml")
 
-
         self._log_inputs()
-        self.logger.info("\tRunning a",self.dimensions,"dimensions material.\n")
+        self.logger.info("\tRunning a", self.dimensions, "dimensions material.\n")
 
     # Run a sequence of processes based on the data
     def run(self):
@@ -303,10 +332,10 @@ class Preprocess:
         self.logger.debug(f"Saved ijltonk.npy in {self.data_dir}")
         self.logger.info("\tIJLTONK saved to file ijltonk.npy, with convertion from ijl to nk")
 
-        with open("data/datafile.npy", "wb") as fich: #TODO: Try saving with np.savez
+        with open("data/datafile.npy", "wb") as fich:  # TODO: Try saving with np.savez
             np.save(fich, __version__)  # Version of berry where data was created
             np.save(fich, self.ref_name)  # Unique reference for the run
-            np.save(fich,self.dimensions) # Number of dimensions of the material
+            np.save(fich, self.dimensions)  # Number of dimensions of the material
 
             np.save(fich, self.work_dir)  # Working directory
             np.save(fich, self.data_dir)  # Directory for saving data
@@ -353,14 +382,14 @@ class Preprocess:
             np.save(fich, self.kvector2)  # Second vector that define volume in k space
             np.save(fich, self.kvector3)  # Third vector that define volume in k space
 
-            np.save(fich, int(self.wfcut))                       # Cutoff band
-            np.save(fich, int(self.wfcut) + 1)                   # Initial band
+            np.save(fich, int(self.wfcut))  # Cutoff band
+            np.save(fich, int(self.wfcut) + 1)  # Initial band
             np.save(fich, int(self.nbnd) - int(self.wfcut) - 1)  # Number of bands to be used in berry
-            np.save(fich, int(self.nbnd) - 1)                    # Final band
-            np.save(fich, float(self.z1))                        # Cut in real space, direction z
-            np.save(fich, float(self.Deltaz))                    # Size of cut, direction z
-            np.save(fich, float(self.y1))                        # Cut in real space, direction y
-            np.save(fich, float(self.Deltay))                    # Size of cut, direction y
+            np.save(fich, int(self.nbnd) - 1)  # Final band
+            np.save(fich, float(self.z1))  # Cut in real space, direction z
+            np.save(fich, float(self.Deltaz))  # Size of cut, direction z
+            np.save(fich, float(self.y1))  # Cut in real space, direction y
+            np.save(fich, float(self.Deltay))  # Size of cut, direction y
             np.save(fich, "dummy")  # Saving space for future values and compatibility
             np.save(fich, "dummy")  # Saving space for future values and compatibility
             np.save(fich, "dummy")  # Saving space for future values and compatibility
@@ -404,7 +433,7 @@ class Preprocess:
                     n1 = -1
                 else:
                     n1 = nk + 1
-                neigh[nk, :] = [n0,n1]
+                neigh[nk, :] = [n0, n1]
         elif self.dimensions == 2:
             neigh = np.full((self.__nks, 4), -1, dtype=np.int64)
             for j in range(self.nky):
@@ -452,14 +481,14 @@ class Preprocess:
                         if l == 0:
                             n4 = -1
                         else:
-                            n4 = nk - self.nkx*self.nky
+                            n4 = nk - self.nkx * self.nky
                         if l == self.nkz - 1:
                             n5 = -1
                         else:
-                            n5 = nk + self.nkx*self.nky
+                            n5 = nk + self.nkx * self.nky
                         neigh[nk, :] = [n0, n1, n2, n3, n4, n5]
         else:
-            self.logger.error(f"\tWrong number of dimensions: they can be only 1, 2 or 3.")
+            self.logger.error("\tWrong number of dimensions: they can be only 1, 2 or 3.")
         return neigh
 
     # Runs the scf DFT calculation
@@ -472,7 +501,7 @@ class Preprocess:
             self.logger.info(f"\t{os.path.basename(scf_out)} already exists. Skipping scf calculation.")
             return
         else:
-            self.logger.info(f"\tRunning scf calculation.")
+            self.logger.info("\tRunning scf calculation.")
 
             command = f"{self.__mpi} pw.x -i {self.scf} > {scf_out}"
             os.system(command)
@@ -493,7 +522,7 @@ class Preprocess:
             self.logger.info(f"\t{os.path.basename(nscf_out)} already exists. Skipping nscf calculation.")
             # return
         else:
-            self.logger.info(f"\tRunning nscf calculation.")
+            self.logger.info("\tRunning nscf calculation.")
 
             command = f"{self.__mpi} pw.x -i {self.nscf} > {nscf_out}"
             os.system(command)
@@ -524,14 +553,18 @@ class Preprocess:
         alat = float(output.find("atomic_structure").attrib["alat"])
         self.logger.info(f"\talat = {alat} bohr")
 
-        self.logger.info(f"\n\tLattice vectors in bohr")
-        self.a1, self.a2, self.a3 = [np.array(list(map(float, it.text.split()))) for it in output.find("atomic_structure").find("cell")]
+        self.logger.info("\n\tLattice vectors in bohr")
+        self.a1, self.a2, self.a3 = [
+            np.array(list(map(float, it.text.split()))) for it in output.find("atomic_structure").find("cell")
+        ]
         self.logger.info(f"\t\ta1: {self.a1}")
         self.logger.info(f"\t\ta2: {self.a2}")
         self.logger.info(f"\t\ta3: {self.a3}")
 
-        self.logger.info(f"\n\tReciprocal lattice vectors in units of 2pi/alat")
-        self.b1, self.b2, self.b3 = [np.array(list(map(float, it.text.split()))) for it in output.find("basis_set").find("reciprocal_lattice")]
+        self.logger.info("\n\tReciprocal lattice vectors in units of 2pi/alat")
+        self.b1, self.b2, self.b3 = [
+            np.array(list(map(float, it.text.split()))) for it in output.find("basis_set").find("reciprocal_lattice")
+        ]
         self.logger.info(f"\t\tb1: {self.b1}")
         self.logger.info(f"\t\tb2: {self.b2}")
         self.logger.info(f"\t\tb3: {self.b3}")
@@ -563,19 +596,23 @@ class Preprocess:
 
         self.vb = self.nelec - 1 if self.non_colinear or self.lsda else (self.nelec / 2) - 1
         if self.vb - int(self.vb) != 0:
-            self.logger.info(f"\tAttention: The system is a metal!")  # TODO: add supoort for metals
+            self.logger.info("\tAttention: The system is a metal!")  # TODO: add supoort for metals
         self.vb = int(self.vb)
         self.logger.info(f"\tValence band is: {self.vb}\n")
 
-        self.eigenvalues = 2 * np.array([list(map(float, it.text.split())) for it in output.find("band_structure").iter("eigenvalues")])
+        self.eigenvalues = 2 * np.array(
+            [list(map(float, it.text.split())) for it in output.find("band_structure").iter("eigenvalues")]
+        )
         # number 2 is to convert from hartree to rydberg energy units
         # QE uses Ha when saving eigenvalues in xml file, everywhere else uses Ry
 
-        self.occupations = np.array([list(map(float, it.text.split())) for it in output.find("band_structure").iter("occupations")])
+        self.occupations = np.array(
+            [list(map(float, it.text.split())) for it in output.find("band_structure").iter("occupations")]
+        )
 
     # Creates the nscf input file based on the original scf input file
     def _nscf_template(self):
-        with open(self.scf, "r") as f:
+        with open(self.scf) as f:
             scf = f.read()
 
         scf_w_nones = scf.replace("automatic", "tpiba").replace("scf", "nscf").split("\n")
@@ -586,15 +623,17 @@ class Preprocess:
         if re.search("nbnd", nscf_content):
             nscf_content = re.sub("nbnd.*", f"nbnd = {str(self.nbnd)},", nscf_content)
         elif re.search(r"SYSTEM\s*/", nscf_content):
-            nscf_content = re.sub(r"SYSTEM\s*/", f"SYSTEM\n                        nbnd = {str(self.nbnd)},\n/", nscf_content)
+            nscf_content = re.sub(
+                r"SYSTEM\s*/", f"SYSTEM\n                        nbnd = {str(self.nbnd)},\n/", nscf_content
+            )
         else:
             nscf_content = re.sub("SYSTEM", f"SYSTEM\n                        nbnd = {str(self.nbnd)},", nscf_content)
 
         # Guarantee no sym calculation for nscf
         if re.search("nosym", nscf_content):
-            nscf_content = re.sub("nosym.*", f"nosym = .true.", nscf_content)
+            nscf_content = re.sub("nosym.*", "nosym = .true.", nscf_content)
         else:
-            nscf_content = re.sub("SYSTEM", f"SYSTEM\n                       nosym = .true.", nscf_content)
+            nscf_content = re.sub("SYSTEM", "SYSTEM\n                       nosym = .true.", nscf_content)
 
         # Replace kpoints with self.nscf_kpoints
         nscf_content += f"\n{self.__nks}\n{self.nscf_kpoints}"
@@ -604,7 +643,7 @@ class Preprocess:
             f.write(nscf_content)
 
     # Creates array of k-points where calculations will be performed
-    def _build_kpoints(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _build_kpoints(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         # Array of k-points
         kpoints = np.zeros((self.__nks, 3), dtype=np.float64)
         # Conversion from real k-point coordinates to integer coordinates
@@ -616,9 +655,15 @@ class Preprocess:
         for l in range(self.nkz):
             for j in range(self.nky):
                 for i in range(self.nkx):
-                    k1 = round(self.k0[0] + self.step*(i*self.kvector1[0] + j*self.kvector2[0] + l*self.kvector3[0]), 8)
-                    k2 = round(self.k0[1] + self.step*(i*self.kvector1[1] + j*self.kvector2[1] + l*self.kvector3[1]), 8)
-                    k3 = round(self.k0[2] + self.step*(i*self.kvector1[2] + j*self.kvector2[2] + l*self.kvector3[2]), 8)
+                    k1 = round(
+                        self.k0[0] + self.step * (i * self.kvector1[0] + j * self.kvector2[0] + l * self.kvector3[0]), 8
+                    )
+                    k2 = round(
+                        self.k0[1] + self.step * (i * self.kvector1[1] + j * self.kvector2[1] + l * self.kvector3[1]), 8
+                    )
+                    k3 = round(
+                        self.k0[2] + self.step * (i * self.kvector1[2] + j * self.kvector2[2] + l * self.kvector3[2]), 8
+                    )
 
                     kkk = f"{k1:.7f}  {k2:.7f}  {k3:.7f}"
                     self.nscf_kpoints += kkk + "  1\n"
@@ -646,7 +691,7 @@ class Preprocess:
         self.logger.info(f"\tTo calculate point in real space where all phases match: {self.point}")
         self.logger.info(f"\tNumber of bands to be calculated: {self.nbnd}")
         if self.wfcut == -1:
-            self.logger.info(f"\tAll bands will be used.\n")
+            self.logger.info("\tAll bands will be used.\n")
         else:
             self.logger.info(f"\tCutoff band (bands bellow, inclusive, will not be used): {self.wfcut}\n")
         self.logger.info(f"\tInitial band is nr {int(self.wfcut) + 1}")
@@ -654,18 +699,18 @@ class Preprocess:
         self.logger.info(f"\tFinal band is band nr {int(self.nbnd) - 1}")
 
         if self.Deltaz == 0 and self.Deltay == 0:
-            self.logger.info(f"\n\tNo volume removed from the supercell.")
+            self.logger.info("\n\tNo volume removed from the supercell.")
         else:
-            self.logger.info(f"\n\tVolume removal: wavefunctions will be set to zero in the region")
+            self.logger.info("\n\tVolume removal: wavefunctions will be set to zero in the region")
             if self.Deltaz != 0:
                 self.logger.info(f"\t\tz: initial limit z1 = {self.z1} bohr, width Deltaz = {self.Deltaz} bohr")
             if self.Deltay != 0:
                 self.logger.info(f"\t\ty: initial limit y1 = {self.y1} bohr, width Deltay = {self.Deltay} bohr")
-            self.logger.info(f"\tThe supercell and the real space grid are not changed by this.")
+            self.logger.info("\tThe supercell and the real space grid are not changed by this.")
             if self.Deltaz != 0 and self.dimensions not in (1, 2):
-                self.logger.info(f"\tAttention: Deltaz is only used in 1 and 2 dimensions; it will be ignored.")
+                self.logger.info("\tAttention: Deltaz is only used in 1 and 2 dimensions; it will be ignored.")
             if self.Deltay != 0 and self.dimensions != 1:
-                self.logger.info(f"\tAttention: Deltay is only used in 1 dimension; it will be ignored.")
+                self.logger.info("\tAttention: Deltay is only used in 1 dimension; it will be ignored.")
 
         self.logger.info(f"\n\tWill use {self.npr} processors\n")
         self.logger.info(f"\tWorking directory: {self.work_dir}")
@@ -681,4 +726,3 @@ class Preprocess:
         self.logger.info(f"\n\tscf input file: {self.scf}")
         self.logger.info(f"\tnscf input file: {self.nscf}")
         self.logger.info(f"\tDFT data file: {self.dft_data_file}\n")
-

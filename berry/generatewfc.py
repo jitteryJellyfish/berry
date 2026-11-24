@@ -1,7 +1,5 @@
-from typing import Optional
-
-import os
 import logging
+import os
 import subprocess
 
 import numpy as np
@@ -9,15 +7,15 @@ import numpy as np
 from berry import log
 
 try:
-    import berry._subroutines.loadmeta as m
     import berry._subroutines.loaddata as d
+    import berry._subroutines.loadmeta as m
 except:
     pass
 
 
-
-def plot_psi(psi, x): # just for debugging
+def plot_psi(psi, x):  # just for debugging
     import matplotlib.pyplot as plt
+
     cores = [
         "black",
         "blue",
@@ -48,30 +46,31 @@ def plot_psi(psi, x): # just for debugging
     for j in range(m.nr3):
         for i in range(m.nr2):
             count = count + 1
-            xarray[i, j] = d.r[x + count*m.nr1, 1]
-            yarray[i, j] = d.r[x + count*m.nr1, 2]
+            xarray[i, j] = d.r[x + count * m.nr1, 1]
+            yarray[i, j] = d.r[x + count * m.nr1, 2]
 
-    ax = fig.add_subplot(projection='3d')
+    ax = fig.add_subplot(projection="3d")
     for banda in range(0, m.nbnd):
         count = -1
         for j in range(m.nr3):
             for i in range(m.nr2):
                 count = count + 1
-                zarray[i, j] = banda*3 + psi[x + count*m.nr1 + banda*m.nr]
-        colorband = np.mod(banda,20)
+                zarray[i, j] = banda * 3 + psi[x + count * m.nr1 + banda * m.nr]
+        colorband = np.mod(banda, 20)
         ax.plot_wireframe(xarray, yarray, zarray, color=cores[colorband])
     plt.show()
 
 
 class WfcGenerator:
-    def __init__(self,
-                 nk_points: Optional[int] = None ,
-                 bands: Optional[int] = None,
-                 logger_name: str = "wfc",
-                 logger_level: int = logging.INFO,
-                 compress: bool = False,
-                 flush: bool = False
-                ):
+    def __init__(
+        self,
+        nk_points: int | None = None,
+        bands: int | None = None,
+        logger_name: str = "wfc",
+        logger_level: int = logging.INFO,
+        compress: bool = False,
+        flush: bool = False,
+    ):
 
         self.compress = compress
 
@@ -83,18 +82,17 @@ class WfcGenerator:
         if nk_points is None and bands is None:
             self.nk_points = range(m.nks)
             self.bands = range(m.wfcut + 1, m.nbnd)
-        elif  bands is None:                          # Just for debugging
+        elif bands is None:  # Just for debugging
             self.nk_points = nk_points
             self.bands = range(m.wfcut + 1, m.nbnd)
-        elif nk_points is None:                       # Just for debugging
+        elif nk_points is None:  # Just for debugging
             self.nk_points = range(m.nks)
             self.bands = bands
-        else:                                         # Just for debugging
+        else:  # Just for debugging
             self.nk_points = nk_points
             self.bands = bands
         self.ref_name = m.refname
         self.logger = log(logger_name, "GENERATE WAVE FUNCTIONS", level=logger_level, flush=flush)
-
 
     def run(self):
         # prints header on the log file
@@ -110,7 +108,6 @@ class WfcGenerator:
         else:
             self.k2r_program = "wfck2r.x"
             self.logger.info("\tNonrelativistic calculation, will use wfck2r.x")
-
 
         self.cut = self._cut()
 
@@ -136,7 +133,7 @@ class WfcGenerator:
                     continue
                 self.logger.info(f"\tCalculating wfc for k-point {nk}")
                 self._wfck2r(nk, m.initial_band, m.final_band, m.number_of_bands)
-        else:                       # Just for debugging
+        else:  # Just for debugging
             if isinstance(self.bands, range):
                 self.logger.info(f"\tWill run for k-point {self.nk_points} and all bands")
                 self.logger.info(f"\tThere are {m.nks} k-points and {m.number_of_bands} bands.\n")
@@ -150,10 +147,9 @@ class WfcGenerator:
         self.logger.info("\n\tRemoving temporary file 'tmp'")
         os.system(f"rm {os.getcwd()}/tmp")
         self.logger.info(f"\tRemoving quantum expresso output file '{m.wfck2r}'")
-        os.system(f"rm {os.path.join(os.getcwd(),m.wfck2r)}")
+        os.system(f"rm {os.path.join(os.getcwd(), m.wfck2r)}")
 
         self.logger.footer()
-
 
     def _log_run_params(self, initial_band, number_of_bands, final_band):
         self.logger.info(f"\tUnique reference of run: {self.ref_name}")
@@ -196,24 +192,28 @@ class WfcGenerator:
 
     def _log_cut(self):  # information about the discarded region, for the log file
         if not self.zcut and not self.ycut:
-            self.logger.info(f"\tNo volume removed from the supercell.\n")
+            self.logger.info("\tNo volume removed from the supercell.\n")
             return
 
-        self.logger.info(f"\tVolume removal: wavefunctions will be set to zero in the region")
+        self.logger.info("\tVolume removal: wavefunctions will be set to zero in the region")
         if self.zcut:
-            self.logger.info(f"\t\tz: from {self.z1} to {self.z2} bohr" +
-                             (f", wrapping around the cell boundary a3 = {m.a3[2]} bohr" if self.splitz else ""))
+            self.logger.info(
+                f"\t\tz: from {self.z1} to {self.z2} bohr"
+                + (f", wrapping around the cell boundary a3 = {m.a3[2]} bohr" if self.splitz else "")
+            )
         if self.ycut:
-            self.logger.info(f"\t\ty: from {self.y1} to {self.y2} bohr" +
-                             (f", wrapping around the cell boundary a2 = {m.a2[1]} bohr" if self.splity else ""))
+            self.logger.info(
+                f"\t\ty: from {self.y1} to {self.y2} bohr"
+                + (f", wrapping around the cell boundary a2 = {m.a2[1]} bohr" if self.splity else "")
+            )
 
         removed = int(np.count_nonzero(self._cut_mask()))
         self.logger.info(f"\tPoints in real space set to zero: {removed} of {m.nr} ({removed / m.nr * 100:.2f} %)")
-        self.logger.info(f"\tThe supercell and the real space grid are not changed by this.\n")
+        self.logger.info("\tThe supercell and the real space grid are not changed by this.\n")
 
     def _cut_mask(self):  # points of the real space grid where psi is set to zero
-        y = d.r[:m.nr, 1]
-        z = d.r[:m.nr, 2]
+        y = d.r[: m.nr, 1]
+        z = d.r[: m.nr, 2]
 
         if self.zcut:
             maskz = (self.z1 < z) | (self.z2 > z) if self.splitz else (self.z1 < z) & (self.z2 > z)
@@ -229,71 +229,95 @@ class WfcGenerator:
     def _cut(self):  # selection of the cut on the psi
         if self.zcut and self.ycut:
             if self.splitz and self.splity:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.y1 < d.r[i % m.nr,1] or self.y2 > d.r[i % m.nr,1] or self.z1 < d.r[i % m.nr,2] or self.z2 > d.r[i % m.nr,2]:
+                        if (
+                            self.y1 < d.r[i % m.nr, 1]
+                            or self.y2 > d.r[i % m.nr, 1]
+                            or self.z1 < d.r[i % m.nr, 2]
+                            or self.z2 > d.r[i % m.nr, 2]
+                        ):
                             psi[i] = 0
                     return psi
-                
+
             elif self.splitz:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if (self.y1 < d.r[i % m.nr,1] and self.y2 > d.r[i % m.nr,1]) or self.z1 < d.r[i % m.nr,2] or self.z2 > d.r[i % m.nr,2]:
+                        if (
+                            (self.y1 < d.r[i % m.nr, 1] and self.y2 > d.r[i % m.nr, 1])
+                            or self.z1 < d.r[i % m.nr, 2]
+                            or self.z2 > d.r[i % m.nr, 2]
+                        ):
                             psi[i] = 0
                     return psi
-                
+
             elif self.splity:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.y1 < d.r[i % m.nr,1] or self.y2 > d.r[i % m.nr,1] or (self.z1 < d.r[i % m.nr,2] and self.z2 > d.r[i % m.nr,2]):
+                        if (
+                            self.y1 < d.r[i % m.nr, 1]
+                            or self.y2 > d.r[i % m.nr, 1]
+                            or (self.z1 < d.r[i % m.nr, 2] and self.z2 > d.r[i % m.nr, 2])
+                        ):
                             psi[i] = 0
                     return psi
             else:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if (self.y1 < d.r[i % m.nr,1] and self.y2 > d.r[i % m.nr,1]) or (self.z1 < d.r[i % m.nr,2] and self.z2 > d.r[i % m.nr,2]):
+                        if (self.y1 < d.r[i % m.nr, 1] and self.y2 > d.r[i % m.nr, 1]) or (
+                            self.z1 < d.r[i % m.nr, 2] and self.z2 > d.r[i % m.nr, 2]
+                        ):
                             psi[i] = 0
                     return psi
         elif self.zcut:
             if self.splitz:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.z1 < d.r[i % m.nr,2] or self.z2 > d.r[i % m.nr,2]:
+                        if self.z1 < d.r[i % m.nr, 2] or self.z2 > d.r[i % m.nr, 2]:
                             psi[i] = 0
                     return psi
             else:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.z1 < d.r[i % m.nr,2] and self.z2 > d.r[i % m.nr,2]:
+                        if self.z1 < d.r[i % m.nr, 2] and self.z2 > d.r[i % m.nr, 2]:
                             psi[i] = 0
                     return psi
         elif self.ycut:
             if self.splity:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.y1 < d.r[i % m.nr,1] or self.y2 > d.r[i % m.nr,1]:
+                        if self.y1 < d.r[i % m.nr, 1] or self.y2 > d.r[i % m.nr, 1]:
                             psi[i] = 0
                     return psi
             else:
+
                 def cut(psi):
                     for i in range(len(psi)):
-                        if self.y1 < d.r[i % m.nr,1] and self.y2 > d.r[i % m.nr,1]:
+                        if self.y1 < d.r[i % m.nr, 1] and self.y2 > d.r[i % m.nr, 1]:
                             psi[i] = 0
                     return psi
         else:
             cut = None
         return cut
 
-
     def _expected_files(self, nk_point: int):
         # The .wfc files a finished k-point must have on disk, matching the naming
         # used when writing in _wfck2r (noncolin -> two spinor parts per band).
         bands = range(m.number_of_bands)
         if m.noncolin:
-            return [os.path.join(m.wfcdirectory, f"k0{nk_point}b0{b + m.initial_band}-{s}.wfc")
-                    for b in bands for s in (0, 1)]
-        return [os.path.join(m.wfcdirectory, f"k0{nk_point}b0{b + m.initial_band}.wfc")
-                for b in bands]
+            return [
+                os.path.join(m.wfcdirectory, f"k0{nk_point}b0{b + m.initial_band}-{s}.wfc")
+                for b in bands
+                for s in (0, 1)
+            ]
+        return [os.path.join(m.wfcdirectory, f"k0{nk_point}b0{b + m.initial_band}.wfc") for b in bands]
 
     def _kpoint_done(self, nk_point: int, validate: bool = False):
         # A k-point counts as done only if every expected file exists and is
@@ -322,22 +346,14 @@ class WfcGenerator:
         output = subprocess.check_output(shell_cmd, shell=True)
 
         # Converts fortran complex numbers to numpy format
-        out1 = (output.decode("utf-8")
-                .replace(")", "j")
-                .replace(", -", "-")
-                .replace(",  ", "+")
-                .replace("(", "")
-                )
-
-
-
+        out1 = output.decode("utf-8").replace(")", "j").replace(", -", "-").replace(",  ", "+").replace("(", "")
 
         if m.noncolin:
             # puts the wavefunctions into a numpy array
             psi = np.fromstring(out1, dtype=complex, sep="\n")
 
             # For each band, find the value of the wfc at the specific point rpoint (in real space)
-            psi_rpoint = np.array([psi[int(m.rpoint) + m.nr * i] for i in range(0,2*number_of_bands,2)])
+            psi_rpoint = np.array([psi[int(m.rpoint) + m.nr * i] for i in range(0, 2 * number_of_bands, 2)])
 
             # Calculate the phase at rpoint for all the bands
             deltaphase = np.arctan2(psi_rpoint.imag, psi_rpoint.real)
@@ -348,20 +364,32 @@ class WfcGenerator:
 
             psifinal0, psifinal1 = [], []
 
-            for i in range(0,2*number_of_bands,2):
-                self.logger.debug(f"\t{nk_point:6d}  {(int(i/2) + initial_band):4d}  {mod_rpoint[int(i/2)]:12.8f}  {deltaphase[int(i/2)]:12.8f}   {not mod_rpoint[int(i/2)] < 1e-5}")
+            for i in range(0, 2 * number_of_bands, 2):
+                self.logger.debug(
+                    f"\t{nk_point:6d}  {(int(i / 2) + initial_band):4d}  {mod_rpoint[int(i / 2)]:12.8f}  {deltaphase[int(i / 2)]:12.8f}   {not mod_rpoint[int(i / 2)] < 1e-5}"
+                )
 
                 # Subtract the reference phase for each point
-                psifinal0 += list(psi[i * m.nr : (i + 1) * m.nr] * np.exp(-1j * deltaphase[int(i/2)]))                # first part of spinor, all bands
-                psifinal1 += list(psi[m.nr + i * m.nr : m.nr + (i + 1) * m.nr] * np.exp(-1j * deltaphase[int(i/2)]))  # second part of spinor, all bands
+                psifinal0 += list(
+                    psi[i * m.nr : (i + 1) * m.nr] * np.exp(-1j * deltaphase[int(i / 2)])
+                )  # first part of spinor, all bands
+                psifinal1 += list(
+                    psi[m.nr + i * m.nr : m.nr + (i + 1) * m.nr] * np.exp(-1j * deltaphase[int(i / 2)])
+                )  # second part of spinor, all bands
             if self.cut is not None:
                 psifinal0 = self.cut(psifinal0)
                 psifinal1 = self.cut(psifinal1)
             # plot_psi(psifinal0, 1) # for debugging
             # plot_psi(psifinal1, 1) # for debugging
 
-            outfiles0 = map(lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band+initial_band}-0.wfc"), range(number_of_bands))
-            outfiles1 = map(lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band+initial_band}-1.wfc"), range(number_of_bands))
+            outfiles0 = map(
+                lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band + initial_band}-0.wfc"),
+                range(number_of_bands),
+            )
+            outfiles1 = map(
+                lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band + initial_band}-1.wfc"),
+                range(number_of_bands),
+            )
 
             for i, outfile in enumerate(outfiles0):
                 with open(outfile, "wb") as fich:
@@ -392,7 +420,9 @@ class WfcGenerator:
 
             psifinal = []
             for i in range(number_of_bands):
-                self.logger.debug(f"\t{nk_point:6d}  {(i + initial_band):4d}  {mod_rpoint[i]:12.8f}  {deltaphase[i]:12.8f}   {not mod_rpoint[i] < 1e-5}")
+                self.logger.debug(
+                    f"\t{nk_point:6d}  {(i + initial_band):4d}  {mod_rpoint[i]:12.8f}  {deltaphase[i]:12.8f}   {not mod_rpoint[i] < 1e-5}"
+                )
 
                 # Subtract the reference phase for each point
                 psifinal += list(psi[i * m.nr : (i + 1) * m.nr] * np.exp(-1j * deltaphase[i]))
@@ -401,7 +431,10 @@ class WfcGenerator:
             psifinal = np.array(psifinal)
 
             # plot_psi(psifinal, 1) # for debugging
-            outfiles = map(lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band+initial_band}.wfc"), range(number_of_bands))
+            outfiles = map(
+                lambda band: os.path.join(m.wfcdirectory, f"k0{nk_point}b0{band + initial_band}.wfc"),
+                range(number_of_bands),
+            )
             for i, outfile in enumerate(outfiles):
                 with open(outfile, "wb") as fich:
                     if self.compress:
@@ -411,7 +444,7 @@ class WfcGenerator:
 
     def _get_command(self, nk_point: int, initial_band: int, final_band: int, number_of_bands: int):
         mpi = "" if m.npr == 1 else f"mpirun -np {m.npr} "
-        command =f"&inputpp prefix = '{m.prefix}',\
+        command = f"&inputpp prefix = '{m.prefix}',\
                         outdir = '{m.outdir}',\
                         first_k = {nk_point + 1},\
                         last_k = {nk_point + 1},\
@@ -419,6 +452,6 @@ class WfcGenerator:
                         last_band = {final_band + 1},\
                         loctave = .true., /"
         if m.noncolin:
-            return f'echo "{command}" | {mpi} wfck2rFR.x > tmp; tail -{m.nr * number_of_bands*2} {m.wfck2r}'
+            return f'echo "{command}" | {mpi} wfck2rFR.x > tmp; tail -{m.nr * number_of_bands * 2} {m.wfck2r}'
         else:
             return f'echo "{command}" | {mpi} wfck2r.x > tmp; tail -{m.nr * number_of_bands} {m.wfck2r}'

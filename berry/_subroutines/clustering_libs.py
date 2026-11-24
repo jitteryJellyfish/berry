@@ -12,28 +12,29 @@ TODO:
   - Implement the algorithm to address points connected to more than one band
 """
 
-
 from __future__ import annotations
-from multiprocessing import get_context
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
-from collections import deque
-from heapq import heappush, heappop
+
+import logging
 import random
 import string
 import textwrap
-from typing import Tuple, Union, Callable
+import time
+from collections import deque
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from heapq import heappop
+from heapq import heappush
+from multiprocessing import get_context
+from typing import Union
 
-import logging
-
+import networkx as nx
+import numpy as np
 from scipy.ndimage import sobel
+from scipy.optimize import curve_fit
+from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import maximum_flow
-from scipy.optimize import curve_fit, linear_sum_assignment
-
-import numpy as np
-import networkx as nx
-import time
 
 from berry import log
 from berry._subroutines.contatempo import tempo
@@ -47,7 +48,7 @@ Band = int
 ###########################################################################
 # Constant Definition
 ###########################################################################
-FORCED = 6              # signal_final / evaluate_result scale (force-filled by completeness pass)
+FORCED = 6  # signal_final / evaluate_result scale (force-filled by completeness pass)
 CORRECT = 5
 POTENTIAL_CORRECT = 4
 POTENTIAL_MISTAKE = 3
@@ -55,7 +56,7 @@ DEGENERATE = 2
 MISTAKE = 1
 NOT_SOLVED = 0
 
-FORCED_CONTINUITY = 5   # correct_signalfinal / evaluate_point (energy-continuity) scale
+FORCED_CONTINUITY = 5  # correct_signalfinal / evaluate_point (energy-continuity) scale
 
 # A direction "supports" a slot's attribution when the dot product between the
 # cell's assigned band and the band assigned to the SAME slot at that neighbour
@@ -72,7 +73,7 @@ DP_SUP_TOL = 0.5
 # therefore form a partial matching per (k, direction) and act as must-keep
 # constraints -- but only LOCALLY: character transport is path-dependent (around a
 # conical intersection it returns on the other sheet), so the transitive closure is
-# NOT single-slottable and global constructions over it are meaningless. 
+# NOT single-slottable and global constructions over it are meaningless.
 # DP_FORBID marks the other mode of the bimodal distribution: a same-slot
 # continuation this weak is evidence AGAINST the attribution whenever any evidence
 # exists at all.
@@ -108,7 +109,7 @@ DEGEN_FREEZE_REFUTED = True
 # replacing the inner Louvain split (which optimises edge density with no
 # notion of energy, dot-product quality or the one-state-per-k constraint,
 # so its cuts through ambiguous crossing regions are arbitrary):
-RG_SEED_DP = 0.9        # min same-band dp for a sovereign (seed) node
+RG_SEED_DP = 0.9  # min same-band dp for a sovereign (seed) node
 RG_DEFER_MARGIN = 0.05  # cost margin within which two labels' claims are contested
 RG_BAND_PRESENCE = 0.5  # fraction of nks a raw band must hold to be a growth target
 
@@ -122,14 +123,15 @@ RG_BAND_PRESENCE = 0.5  # fraction of nks a raw band must hold to be a growth ta
 _PARALLEL_FN: Union[Callable, None] = None
 _PARALLEL_ARGS: tuple = ()
 
+
 def _parallel_dispatch(chunk):
-    '''
+    """
     Module-level entry point executed by the Pool workers.
     It forwards each chunk to the currently published worker function.
     Being module-level, it (unlike a closure) is picklable so it can be
     dispatched to the Pool, while the actual worker function is read from the
     fork-inherited module global.
-    '''
+    """
     return _PARALLEL_FN(chunk, *_PARALLEL_ARGS)
 
 
@@ -144,15 +146,16 @@ def _parallel_dispatch(chunk):
 # bit-identical to polyfit. At most a handful of distinct offset-sets occur.
 _EXTRAP_WEIGHT_CACHE: dict = {}
 
+
 def _extrap_weights(offsets: tuple) -> np.ndarray:
-    '''
+    """
     Weight row ``w`` such that the least-squares quadratic through points at the
     given integer ``offsets`` (x-values), evaluated at x=+1, equals ``w @ energies``.
-    '''
+    """
     w = _EXTRAP_WEIGHT_CACHE.get(offsets)
     if w is None:
         X = np.asarray(offsets, dtype=float)
-        V = np.vander(X, 3)                                   # columns [x^2, x, 1]
+        V = np.vander(X, 3)  # columns [x^2, x, 1]
         w = (np.vander(np.array([1.0]), 3) @ np.linalg.pinv(V)).ravel()
         _EXTRAP_WEIGHT_CACHE[offsets] = w
     return w
@@ -170,41 +173,45 @@ def _extrap_weights(offsets: tuple) -> np.ndarray:
 # fixed ranges, so the distribution shape is mergeable too. _FE_DEBUG gates the
 # accumulation so a production run pays nothing when it is off.
 _FE_DEBUG: bool = False
-_FE_RESID_EDGES = (0.5, 1.0, 2.0, 5.0)      # residual / disp_scale bucket edges
+_FE_RESID_EDGES = (0.5, 1.0, 2.0, 5.0)  # residual / disp_scale bucket edges
+
 
 def _fe_stats_new() -> dict:
-    '''A zeroed f(E)-diagnostics accumulator.'''
+    """A zeroed f(E)-diagnostics accumulator."""
     return {
-        'calls': 0,          # predict_energy invocations
-        'fit': 0,            # ... that produced a fitted (used) energy
-        'fallback': 0,       # ... that returned None (no continuous segment) -> nearest-E default
-        'clip_hit': 0,       # fitted predictions clamped by the disp_scale window
-        'trunc': 0,          # trajectories shortened by the cliff-break
-        'kept_len_sum': 0,   # sum of kept-trajectory lengths (for a mean)
-        'brk_ejump': 0,      # cliff-break caused by an energy step > accept_E
-        'brk_band': 0,       # cliff-break caused by a raw-band-index change
-        'pair_n': 0,         # scored (k-edge, neighbour) pairs
-        'conn_sum': 0.0,     # sum of alpha*connection contributions
-        'eng_sum': 0.0,      # sum of (1-alpha)*energy_val contributions
-        'resid_n': 0,        # predictions with a measurable residual
-        'resid_buckets': [0, 0, 0, 0, 0],   # |resid|/disp_scale in [<0.5,<1,<2,<5,>=5]
+        "calls": 0,  # predict_energy invocations
+        "fit": 0,  # ... that produced a fitted (used) energy
+        "fallback": 0,  # ... that returned None (no continuous segment) -> nearest-E default
+        "clip_hit": 0,  # fitted predictions clamped by the disp_scale window
+        "trunc": 0,  # trajectories shortened by the cliff-break
+        "kept_len_sum": 0,  # sum of kept-trajectory lengths (for a mean)
+        "brk_ejump": 0,  # cliff-break caused by an energy step > accept_E
+        "brk_band": 0,  # cliff-break caused by a raw-band-index change
+        "pair_n": 0,  # scored (k-edge, neighbour) pairs
+        "conn_sum": 0.0,  # sum of alpha*connection contributions
+        "eng_sum": 0.0,  # sum of (1-alpha)*energy_val contributions
+        "resid_n": 0,  # predictions with a measurable residual
+        "resid_buckets": [0, 0, 0, 0, 0],  # |resid|/disp_scale in [<0.5,<1,<2,<5,>=5]
     }
 
+
 def _fe_stats_merge(dst: dict, src: dict) -> None:
-    '''Sum-merge ``src`` into ``dst`` (both produced by _fe_stats_new).'''
+    """Sum-merge ``src`` into ``dst`` (both produced by _fe_stats_new)."""
     for key, val in src.items():
-        if key == 'resid_buckets':
+        if key == "resid_buckets":
             for i in range(len(val)):
                 dst[key][i] += val[i]
         else:
             dst[key] += val
 
+
 # Per-worker live accumulator. Reset at the start of each evaluate_sample chunk,
 # its delta returned to the parent at the end of the chunk.
 _FE_STATS: dict = _fe_stats_new()
 
+
 def _fe_resid_bucket(resid: float, disp_scale: float) -> int:
-    '''Index of the residual/disp_scale bucket for ``resid``.'''
+    """Index of the residual/disp_scale bucket for ``resid``."""
     if not disp_scale or disp_scale <= 0:
         return len(_FE_RESID_EDGES)
     r = abs(resid) / disp_scale
@@ -214,9 +221,8 @@ def _fe_resid_bucket(resid: float, disp_scale: float) -> int:
     return len(_FE_RESID_EDGES)
 
 
-def _energy_continuity_score(Enew: float, Ecand: float,
-                             accept_E: float = None, disp_scale: float = None) -> float:
-    '''
+def _energy_continuity_score(Enew: float, Ecand: float, accept_E: float = None, disp_scale: float = None) -> float:
+    """
     Directional energy-continuity score in [0, 1] between a predicted energy
     ``Enew`` (extrapolated along the line joining the reference and the new
     point) and a specific candidate energy ``Ecand`` (the neighbour's band).
@@ -232,19 +238,18 @@ def _energy_continuity_score(Enew: float, Ecand: float,
 
     With ``accept_E``/``disp_scale`` unset this reduces to a plain closeness in
     [0, 1] so callers that do not pass the scales keep working.
-    '''
+    """
     resid = abs(Enew - Ecand)
     if accept_E is not None and resid > accept_E:
-        return 0.0                                   # gross-jump veto (loose, accept_E)
+        return 0.0  # gross-jump veto (loose, accept_E)
     sigma = disp_scale if (disp_scale and disp_scale > 0) else accept_E
     if not sigma or sigma <= 0:
         return 1.0 if resid == 0 else 0.0
-    return float(sigma / (sigma + resid))            # continuity-residual, scale-aware
+    return float(sigma / (sigma + resid))  # continuity-residual, scale-aware
 
 
-def _local_scales(accept_E: float, disp_scale: float,
-                  local_gap: float, band_disp: float) -> Tuple[float, float]:
-    '''
+def _local_scales(accept_E: float, disp_scale: float, local_gap: float, band_disp: float) -> tuple[float, float]:
+    """
     Sharpen the global energy scales to the LOCAL band neighbourhood, never
     loosening them. The global ``accept_E`` (3x the p99.9 dispersion of the
     whole spectrum) is wider than the inter-band gap of a crowded manifold, so
@@ -260,10 +265,15 @@ def _local_scales(accept_E: float, disp_scale: float,
     resolve the dispersion (near-degenerate / unresolved crowding), return the
     global scales unchanged: energy cannot referee there and a sharp gate
     would only manufacture mistakes; dot-product evidence has to decide.
-    '''
-    if (accept_E is None or local_gap is None or band_disp is None
-            or not np.isfinite(local_gap) or band_disp <= 0
-            or local_gap <= 2.0 * band_disp):
+    """
+    if (
+        accept_E is None
+        or local_gap is None
+        or band_disp is None
+        or not np.isfinite(local_gap)
+        or band_disp <= 0
+        or local_gap <= 2.0 * band_disp
+    ):
         return accept_E, disp_scale
     gate = min(accept_E, max(0.5 * local_gap, band_disp))
     disp = min(disp_scale, band_disp) if (disp_scale and disp_scale > 0) else band_disp
@@ -289,11 +299,11 @@ REPAIR_W_DP, REPAIR_W_E = 0.6, 0.4
 # QE's ethr (8.9e-10 Ry there) is NOT a usable predictor of it -- the per-k
 # Davidson error does not cancel in k-differences, so the noise actually seen
 # in E(k) is ~800x larger.
-DISP_NOISE_FLOOR = 2e-6   # Ry
+DISP_NOISE_FLOOR = 2e-6  # Ry
 
 
-EVALUATE_RESULT_HEADER = ['NOT', 'MIS', 'DEG', 'PMI', 'PCO', 'COR', 'FOR']
-VALIDATE_RESULT_HEADER = ['NOT', 'MIS', 'DEG', 'OTH', 'COR', 'FOR']
+EVALUATE_RESULT_HEADER = ["NOT", "MIS", "DEG", "PMI", "PCO", "COR", "FOR"]
+VALIDATE_RESULT_HEADER = ["NOT", "MIS", "DEG", "OTH", "COR", "FOR"]
 
 ###########################################################################
 # Column legends (shared by every report table)
@@ -301,48 +311,53 @@ VALIDATE_RESULT_HEADER = ['NOT', 'MIS', 'DEG', 'OTH', 'COR', 'FOR']
 # Short, human-readable meaning of each table column. Keyed by the column
 # abbreviation so a legend can be built that always matches the columns shown.
 COLUMN_LEGEND = {
-    'NOT':    'not solved (no band attributed)',
-    'MIS':    'mistake (energy break and/or dot product <= 0.2)',
-    'DEG':    'degenerate (needs basis rotation)',
-    'PMI':    'potential mistake (dot product <= 0.8)',
-    'PCO':    'potential correct (0.8 < dot product < 0.9)',
-    'OTH':    'other (partial energy continuity)',
-    'COR':    'correct (energy-continuous, dot product > 0.9)',
-    'FOR':    'forced (force-filled by the completeness pass; not a genuine solve)',
-    'Score':  'mean dot product of the band over its genuine points, excluding benign force-fills (1 is best)',
-    'Failed': 'NOT + MIS points (energy break / low overlap)',
-    'Degen':  'degenerate points (need basis rotation)',
-    'Forced': 'force-filled points (not a genuine solve)',
-    'Benign': 'force-fills inside a near-degenerate doublet (gauge-level relabeling; do not affect usability)',
-    'Susp':   'force-fills across a real energy gap (suspect; downgrade the band)',
-    'Silent': 'validated cells sitting on a gross energy jump (> accept_E) to a same-slot neighbour -- the cliffs visible in a band plot',
-    'Cliff':  'raw-band switch edges surviving on a jump above the LOCAL continuity gate (sub-accept_E cliffs the Silent column is too loose to see); a band with any is downgraded',
-    'dpBreak': 'raw-band switch edges surviving against a CERTAIN dp link -- the energy-quiet permutation cycles the rotation pass could not unwind (a wavefunction discontinuity invisible to every energy column); a band with any is downgraded',
-    'Status': 'CLEAN (pristine, nothing flagged) / USABLE (no genuine errors; may carry benign force-fills or a sub-pristine score) / ROTATE (needs basis rotation) / CHECK (a suspect force-fill across a real gap, a silent cliff, a sub-gate cliff, or a dp break -> verify) / FAIL (genuine energy break, or many suspect/silent/cliff/dp-break cells)',
+    "NOT": "not solved (no band attributed)",
+    "MIS": "mistake (energy break and/or dot product <= 0.2)",
+    "DEG": "degenerate (needs basis rotation)",
+    "PMI": "potential mistake (dot product <= 0.8)",
+    "PCO": "potential correct (0.8 < dot product < 0.9)",
+    "OTH": "other (partial energy continuity)",
+    "COR": "correct (energy-continuous, dot product > 0.9)",
+    "FOR": "forced (force-filled by the completeness pass; not a genuine solve)",
+    "Score": "mean dot product of the band over its genuine points, excluding benign force-fills (1 is best)",
+    "Failed": "NOT + MIS points (energy break / low overlap)",
+    "Degen": "degenerate points (need basis rotation)",
+    "Forced": "force-filled points (not a genuine solve)",
+    "Benign": "force-fills inside a near-degenerate doublet (gauge-level relabeling; do not affect usability)",
+    "Susp": "force-fills across a real energy gap (suspect; downgrade the band)",
+    "Silent": "validated cells sitting on a gross energy jump (> accept_E) to a same-slot neighbour -- the cliffs visible in a band plot",
+    "Cliff": "raw-band switch edges surviving on a jump above the LOCAL continuity gate (sub-accept_E cliffs the Silent column is too loose to see); a band with any is downgraded",
+    "dpBreak": "raw-band switch edges surviving against a CERTAIN dp link -- the energy-quiet permutation cycles the rotation pass could not unwind (a wavefunction discontinuity invisible to every energy column); a band with any is downgraded",
+    "Status": "CLEAN (pristine, nothing flagged) / USABLE (no genuine errors; may carry benign force-fills or a sub-pristine score) / ROTATE (needs basis rotation) / CHECK (a suspect force-fill across a real gap, a silent cliff, a sub-gate cliff, or a dp break -> verify) / FAIL (genuine energy break, or many suspect/silent/cliff/dp-break cells)",
 }
 
 # All report tables and their surrounding content use these two indent levels:
 #   TITLE_INDENT  for the '====== ... ======' section header,
 #   BODY_INDENT   for legends, table headers and table rows.
-TITLE_INDENT = '\t'
-BODY_INDENT = '\t\t'
+TITLE_INDENT = "\t"
+BODY_INDENT = "\t\t"
+
 
 def _format_legend(columns: list, indent: str = BODY_INDENT) -> str:
-    '''
+    """
     A wrapped legend block explaining every column in ``columns``, indented to
     line up with the table body. Columns with no known meaning are skipped.
-    '''
+    """
     items = [f"{c} = {COLUMN_LEGEND[c]}" for c in columns if c in COLUMN_LEGEND]
-    return '\n' + textwrap.fill(
-        ' | '.join(items),
-        width=100,
-        initial_indent=indent + 'Legend: ',
-        subsequent_indent=indent + '        ',
-    ) + '\n'
+    return (
+        "\n"
+        + textwrap.fill(
+            " | ".join(items),
+            width=100,
+            initial_indent=indent + "Legend: ",
+            subsequent_indent=indent + "        ",
+        )
+        + "\n"
+    )
 
 
 def evaluate_result(values: Union[list[Connection], np.ndarray]) -> int:
-    '''
+    """
     This function attributes the correspondent signal using
     the dot product between each neighbor.
 
@@ -362,13 +377,13 @@ def evaluate_result(values: Union[list[Connection], np.ndarray]) -> int:
             4     :  POTENTIAL_CORRECT     0.8 < C < 0.9
             5     :  CORRECT               C > 0.9
             6     :  FORCED                (assigned by the completeness pass, not here)
-    '''
+    """
 
-    TOL = 0.9       # Tolerance for CORRECT output
-    TOL_DEG = 0.8   # Tolerance for POTENTIAL_CORRECT output
-    TOL_MIN = 0.2   # Tolerance for POTENTIAL_MISTAKE output
+    TOL = 0.9  # Tolerance for CORRECT output
+    TOL_DEG = 0.8  # Tolerance for POTENTIAL_CORRECT output
+    TOL_MIN = 0.2  # Tolerance for POTENTIAL_MISTAKE output
 
-    value = np.mean(values) # Mean conection of each k point
+    value = np.mean(values)  # Mean conection of each k point
 
     if value > TOL:
         return CORRECT
@@ -381,11 +396,21 @@ def evaluate_result(values: Union[list[Connection], np.ndarray]) -> int:
 
     return MISTAKE
 
-def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_matrix: np.ndarray,
-                   bands: np.ndarray, energies: np.ndarray,
-                   accept_E: float = None, disp_scale: float = None,
-                   local_gap: np.ndarray = None, band_disp: np.ndarray = None) -> Tuple[int, list[int]]:
-    '''
+
+def evaluate_point(
+    dimension: int,
+    k: Kpoint,
+    bn: Band,
+    k_index: np.ndarray,
+    k_matrix: np.ndarray,
+    bands: np.ndarray,
+    energies: np.ndarray,
+    accept_E: float = None,
+    disp_scale: float = None,
+    local_gap: np.ndarray = None,
+    band_disp: np.ndarray = None,
+) -> tuple[int, list[int]]:
+    """
     Assign a signal value depending on energy continuity.
 
     Parameters
@@ -404,7 +429,7 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
             An array with the information of current solution of band clustering.
         energies: array_like
             It contais the energy value for each k point.
-    
+
     Returns
         (signal, scores): Tuple[int, list[int]]
             scores: list[int]
@@ -420,8 +445,8 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
                 2     :  DEGENERATE            It is a degenerate point.
                 3     :  OTHER                 0 < N < 2*dimension
                 4     :  CORRECT               N = 2*dimension
-    '''
-    
+    """
+
     CORRECT = 4
     MISTAKE = 1
     OTHER = 3
@@ -437,10 +462,10 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
     # If no scales are passed (unwired path) keep the original 0.9 so behaviour is
     # unchanged for any caller that does not supply disp_scale.
     TOL = 0.5 if disp_scale is not None else 0.9
-    N = 4                           # Number of points to fit the curve
-    N_NEIGS = 2 * dimension         # Number of neighbors to consider the continuity
+    N = 4  # Number of points to fit the curve
+    N_NEIGS = 2 * dimension  # Number of neighbors to consider the continuity
 
-    mach_bn = bands[k, bn]          # original band
+    mach_bn = bands[k, bn]  # original band
     if mach_bn < 0:
         # Unattributed cell: nothing to validate (and eigenvalues[k, -1] would
         # silently read the LAST band). Grade it a mistake with no continuous
@@ -448,37 +473,35 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
         return MISTAKE, np.zeros(N_NEIGS, dtype=int)
 
     if dimension == 1:
-        ik = k_index[k]             # k point index on k-space
+        ik = k_index[k]  # k point index on k-space
     elif dimension == 2:
-        ik, jk = k_index[k]         # k point indices on k-space
+        ik, jk = k_index[k]  # k point indices on k-space
     else:
-        ik, jk, kk = k_index[k]     # k point indices on k-space
+        ik, jk, kk = k_index[k]  # k point indices on k-space
 
-    Ek = energies[k, mach_bn]       # k point's Energy value
+    Ek = energies[k, mach_bn]  # k point's Energy value
 
     # Sharpen the gate/decay scales to the assigned band's local neighbourhood
     # (half the local adjacent gap where it resolves the band's dispersion,
     # unchanged global scales elsewhere -- see _local_scales).
     if local_gap is not None and band_disp is not None and mach_bn >= 0:
-        accept_E, disp_scale = _local_scales(accept_E, disp_scale,
-                                             float(local_gap[k, mach_bn]),
-                                             float(band_disp[mach_bn]))
+        accept_E, disp_scale = _local_scales(
+            accept_E, disp_scale, float(local_gap[k, mach_bn]), float(band_disp[mach_bn])
+        )
 
     def difference_energy(Ek: float, Enew: float) -> float:
-        '''
+        """
         Directional energy-continuity score in [0, 1] between the assigned energy
         ``Ek`` and the energy ``Enew`` extrapolated along ONE direction (the line
         joining this k-point to that direction's neighbours). The direction is
         "continuous" when the band's own energy matches the prediction from that
         direction's trajectory, within the local dispersion ``disp_scale``, with a
         gross-jump veto at ``accept_E`` for inter-group walls.
-        '''
-        return _energy_continuity_score(float(Ek), float(Enew),
-                                        accept_E=accept_E, disp_scale=disp_scale)
-
+        """
+        return _energy_continuity_score(float(Ek), float(Enew), accept_E=accept_E, disp_scale=disp_scale)
 
     if dimension == 1:
-        directions = np.array([[1], [-1]])                     # Right, Left
+        directions = np.array([[1], [-1]])  # Right, Left
         energy_vals = []
 
         ###########################################################################
@@ -487,13 +510,13 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
 
         for direction in directions:
             # Iterates each direction and obtain N points to be used for fit the curve
-            n = np.repeat(np.arange(1,N+1),2).reshape(N,2)
-            kn_index = n*direction + np.array([ik])
+            n = np.repeat(np.arange(1, N + 1), 2).reshape(N, 2)
+            kn_index = n * direction + np.array([ik])
             i = kn_index[:, 0]
             i = i[i >= 0]
             i = i[i < k_matrix.shape[0]]
 
-            ks = k_matrix[i] if len(i) > 0 else []               # Identify the N k points
+            ks = k_matrix[i] if len(i) > 0 else []  # Identify the N k points
             if len(ks) > 0:
                 # Skip unattributed (-1) cells: eigenvalues[k, -1] would silently
                 # read the LAST band's energy into the fit (same trap guarded in
@@ -515,14 +538,13 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
             Es = energies[ks, k_bands]
             X = i
             new_x = ik
-            pol = lambda x, a, b, c: a*x**2 + b*x + c           # Second order polynomial
-            popt, pcov = curve_fit(pol, X, Es)                  # Curve fitting
-            Enew = pol(new_x, *popt)                            # Obtain Energy value
-            energy_vals.append(difference_energy(Ek, Enew))     # Calculate score
+            pol = lambda x, a, b, c: a * x**2 + b * x + c  # Second order polynomial
+            popt, pcov = curve_fit(pol, X, Es)  # Curve fitting
+            Enew = pol(new_x, *popt)  # Obtain Energy value
+            energy_vals.append(difference_energy(Ek, Enew))  # Calculate score
 
     elif dimension == 2:
-
-        directions = np.array([[1,0], [0,1], [-1,0], [0,-1]])       # Down, Right, Up, Left
+        directions = np.array([[1, 0], [0, 1], [-1, 0], [0, -1]])  # Down, Right, Up, Left
         energy_vals = []
 
         ###########################################################################
@@ -531,10 +553,10 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
 
         for direction in directions:
             # Iterates each direction and obtain N points to be used for fit the curve
-            n = np.repeat(np.arange(1,N+1),2).reshape(N,2)
-            kn_index = n*direction + np.array([ik, jk])
-            i, j = kn_index[:, 0], kn_index[:, 1]   # Selects the indices of these N points
-            flag = len(np.unique(i)) > 1            # Necessary to identify which will be the direction of the fit
+            n = np.repeat(np.arange(1, N + 1), 2).reshape(N, 2)
+            kn_index = n * direction + np.array([ik, jk])
+            i, j = kn_index[:, 0], kn_index[:, 1]  # Selects the indices of these N points
+            flag = len(np.unique(i)) > 1  # Necessary to identify which will be the direction of the fit
             if flag:
                 i = i[i >= 0]
                 i = i[i < k_matrix.shape[0]]
@@ -543,8 +565,8 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
                 j = j[j >= 0]
                 j = j[j < k_matrix.shape[1]]
                 i = np.full(len(j), i[0])
-            
-            ks = k_matrix[i, j] if len(i) > 0 else []   # Identify the N k points
+
+            ks = k_matrix[i, j] if len(i) > 0 else []  # Identify the N k points
             if len(ks) > 0:
                 # Skip unattributed (-1) cells (see the 1D branch).
                 sel = bands[ks, bn] >= 0
@@ -565,14 +587,15 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
             Es = energies[ks, k_bands]
             X = i if flag else j
             new_x = ik if flag else jk
-            pol = lambda x, a, b, c: a*x**2 + b*x + c           # Second order polynomial
-            popt, pcov = curve_fit(pol, X, Es)                  # Curve fitting
-            Enew = pol(new_x, *popt)                            # Obtain Energy value
-            energy_vals.append(difference_energy(Ek, Enew))     # Calculate score
-    
+            pol = lambda x, a, b, c: a * x**2 + b * x + c  # Second order polynomial
+            popt, pcov = curve_fit(pol, X, Es)  # Curve fitting
+            Enew = pol(new_x, *popt)  # Obtain Energy value
+            energy_vals.append(difference_energy(Ek, Enew))  # Calculate score
+
     else:
-            
-        directions = np.array([[1,0,0], [0,1,0], [0,0,1], [-1,0,0], [0,-1,0], [0,0,-1]]) # Down, Right, Up, Left, Front, Back
+        directions = np.array(
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1], [-1, 0, 0], [0, -1, 0], [0, 0, -1]]
+        )  # Down, Right, Up, Left, Front, Back
         energy_vals = []
 
         ###########################################################################
@@ -581,8 +604,8 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
 
         for direction in directions:
             # Iterates each direction and obtain N points to be used for fit the curve
-            n = np.repeat(np.arange(1,N+1),3).reshape(N,3)
-            kn_index = n*direction + np.array([ik, jk, kk])
+            n = np.repeat(np.arange(1, N + 1), 3).reshape(N, 3)
+            kn_index = n * direction + np.array([ik, jk, kk])
             # k3 (not k): the k-point argument must not be shadowed
             i, j, k3 = kn_index[:, 0], kn_index[:, 1], kn_index[:, 2]
             flag_i = len(np.unique(i)) > 1
@@ -604,7 +627,7 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
                 i = np.full(len(k3), i[0])
                 j = np.full(len(k3), j[0])
 
-            ks = k_matrix[i, j, k3] if len(i) > 0 else []   # Identify the N k points
+            ks = k_matrix[i, j, k3] if len(i) > 0 else []  # Identify the N k points
             if len(ks) > 0:
                 # Skip unattributed (-1) cells (see the 1D branch).
                 sel = bands[ks, bn] >= 0
@@ -626,16 +649,15 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
             Es = energies[ks, k_bands]
             X = i if flag_i else j if flag_j else k3
             new_x = ik if flag_i else jk if flag_j else kk
-            pol = lambda x, a, b, c: a*x**2 + b*x + c           # Second order polynomial
-            popt, pcov = curve_fit(pol, X, Es)                  # Curve fitting
-            Enew = pol(new_x, *popt)                            # Obtain Energy value
-            energy_vals.append(difference_energy(Ek, Enew))     # Calculate score
+            pol = lambda x, a, b, c: a * x**2 + b * x + c  # Second order polynomial
+            popt, pcov = curve_fit(pol, X, Es)  # Curve fitting
+            Enew = pol(new_x, *popt)  # Obtain Energy value
+            energy_vals.append(difference_energy(Ek, Enew))  # Calculate score
 
-    
     energy_vals = np.array(energy_vals)
-    scores = (energy_vals > TOL)*1  # Verification energy continuity on each direction
-    score = np.sum(scores)          # Counting how many directions preserves energy continuity
-    
+    scores = (energy_vals > TOL) * 1  # Verification energy continuity on each direction
+    score = np.sum(scores)  # Counting how many directions preserves energy continuity
+
     if score == N_NEIGS:
         return CORRECT, scores
     if score == 0:
@@ -644,7 +666,7 @@ def evaluate_point(dimension:int, k: Kpoint, bn: Band, k_index: np.ndarray, k_ma
 
 
 class MATERIAL:
-    '''
+    """
     This object contains all information about the material that
     will be used to solve their bands' problem.
 
@@ -652,7 +674,7 @@ class MATERIAL:
         d : int
             Dimension of the problem.
         nk_i : list[int]
-            It contains the number of k points on each direction. 
+            It contains the number of k points on each direction.
         nbnb : int
             Total number of bands.
         total_bands : int
@@ -705,18 +727,30 @@ class MATERIAL:
         correct_signal() : None
             This function evaluates the k-point signal calculated on previous analysis and attributes
                 a new signal value depending only on energy continuity.
-    '''     
-    def __init__(self, dimensions:int, nk_i: list[int], nbnd: int, nks: int, eigenvalues: np.ndarray,
-                 connections: np.ndarray, neighbors: np.ndarray, logger: log, min_band: int,
-                 max_band: int = -1, n_process: int=1) -> None:
-        '''
+    """
+
+    def __init__(
+        self,
+        dimensions: int,
+        nk_i: list[int],
+        nbnd: int,
+        nks: int,
+        eigenvalues: np.ndarray,
+        connections: np.ndarray,
+        neighbors: np.ndarray,
+        logger: log,
+        min_band: int,
+        max_band: int = -1,
+        n_process: int = 1,
+    ) -> None:
+        """
         Initialize the object.
 
         Parameters
             d : int
                 Dimension of the problem.
             nk_i : list[int]
-                It contains the number of k points on each direction. 
+                It contains the number of k points on each direction.
             nbnb : int
                 Total number of bands.
             total_bands : int
@@ -739,7 +773,7 @@ class MATERIAL:
                 bands up to nbnd-1).
             n_process : int
                 Number of processes to use.
-        '''
+        """
         self.dimensions = dimensions
         self.nkx, self.nky, self.nkz = nk_i
         # Band window [min_band, max_band] (absolute band indices; max_band == -1
@@ -749,15 +783,17 @@ class MATERIAL:
         # this window HERE, so the whole solver sees one consistent band count.
         nb = (max_band + 1 - min_band) if max_band != -1 else (nbnd - min_band)
         if nb <= 0:
-            raise ValueError(f'empty band window: min_band={min_band}, max_band={max_band}')
+            raise ValueError(f"empty band window: min_band={min_band}, max_band={max_band}")
         if connections.shape[2] < nb:
-            raise ValueError(f'dp.npy holds {connections.shape[2]} band(s) but the requested '
-                             f'window [{min_band}, {max_band}] needs {nb} -- re-run dot with '
-                             f'more bands or lower max_band')
+            raise ValueError(
+                f"dp.npy holds {connections.shape[2]} band(s) but the requested "
+                f"window [{min_band}, {max_band}] needs {nb} -- re-run dot with "
+                f"more bands or lower max_band"
+            )
         self.nbnd = nb
         self.total_bands = nb
         self.nks = nks
-        self.eigenvalues = eigenvalues[:, min_band:min_band + nb]
+        self.eigenvalues = eigenvalues[:, min_band : min_band + nb]
         self.connections = connections[:, :, :nb, :nb] if connections.shape[2] > nb else connections
         self.neighbors = neighbors
         self.number_neighbors = self.dimensions * 2
@@ -767,16 +803,16 @@ class MATERIAL:
         self.min_band = min_band
 
     def make_BandsEnergy(self) -> np.ndarray:
-        '''
+        """
         It sets the energy information in more convenient data structure
-        
+
         Parameters
             None
-        
+
         Returns
             BandsEnergy : array_like
                 An array with the information about each energy value on k-space.
-        '''
+        """
         # BandsEnergy[bn, ikx(, iky(, ikz))] = eigenvalues[k, bn] with the k-points
         # laid out kx-fastest (k = ((ikz*nky) + iky)*nkx + ikx -- the same order
         # make_kpointsIndex uses), which is a plain reshape + axis reversal.
@@ -784,29 +820,26 @@ class MATERIAL:
             return self.eigenvalues.T.copy()
 
         if self.dimensions == 2:
-            return self.eigenvalues.T.reshape(
-                self.nbnd, self.nky, self.nkx).transpose(0, 2, 1).copy()
+            return self.eigenvalues.T.reshape(self.nbnd, self.nky, self.nkx).transpose(0, 2, 1).copy()
 
-        return self.eigenvalues.T.reshape(
-            self.nbnd, self.nkz, self.nky, self.nkx).transpose(0, 3, 2, 1).copy()
+        return self.eigenvalues.T.reshape(self.nbnd, self.nkz, self.nky, self.nkx).transpose(0, 3, 2, 1).copy()
 
     def make_kpointsIndex(self) -> None:
-        '''
+        """
         It computes the indices of each k point in their correspondence in k-space.
-        '''
+        """
         if self.dimensions == 1:
             self.matrix = np.arange(self.nks)
             self.kpoints_index = np.arange(self.nks)
             return
-    
+
         if self.dimensions == 2:
             My, Mx = np.meshgrid(np.arange(self.nky), np.arange(self.nkx))
             self.matrix = My * self.nkx + Mx
             counts = np.arange(self.nks)
-            self.kpoints_index = np.stack([counts % self.nkx, counts//self.nkx],
-                                            axis=1)
+            self.kpoints_index = np.stack([counts % self.nkx, counts // self.nkx], axis=1)
             return
-        
+
         self.matrix = np.empty((self.nkx, self.nky, self.nkz), int)
         self.kpoints_index = np.empty((self.nks, 3), int)
         count = -1
@@ -818,7 +851,7 @@ class MATERIAL:
                     self.kpoints_index[count] = [i, j, k]
 
     def make_vectors(self) -> None:
-        '''
+        """
         It transforms the information into more convenient data structures.
         The band window (min_band/max_band) is fixed at construction time
         (see ``MATERIAL.__init__``); this method only derives structures.
@@ -831,14 +864,14 @@ class MATERIAL:
             self.GRPAH: It is a graph in which each node represents a vector.
             self.energies: It contains the energy values for each band distributed
                         in a matrix.
-        '''
-        process_name = '\tMaking Vectors'
+        """
+        process_name = "\tMaking Vectors"
         self.logger.percent_complete(0, 100, title=process_name)
 
         ###########################################################################
         # Compute the auxiliar information
         ###########################################################################
-        self.GRAPH = nx.Graph()     # Create the initail Graph
+        self.GRAPH = nx.Graph()  # Create the initail Graph
         nbnd = self.nbnd
         self.make_kpointsIndex()
         energies = self.make_BandsEnergy()
@@ -847,7 +880,7 @@ class MATERIAL:
         ###########################################################################
         # Compute the vector representation of each k point
         ###########################################################################
-        n_vectors = nbnd*self.nks
+        n_vectors = nbnd * self.nks
         ik = np.tile(self.kpoints_index[:, 0], nbnd) if self.dimensions > 1 else np.tile(self.kpoints_index, nbnd)
 
         stack_aux = [ik]
@@ -859,47 +892,49 @@ class MATERIAL:
             kk = np.tile(self.kpoints_index[:, 2], nbnd)
             stack_aux.append(kk)
 
-        bands = np.arange(0 , nbnd)
+        bands = np.arange(0, nbnd)
         eigenvalues = self.eigenvalues[:, bands].T.reshape(n_vectors)
         stack_aux.append(eigenvalues)
 
         self.vectors = np.stack(stack_aux, axis=1)
         self.logger.percent_complete(100, 100, title=process_name)
 
-        self.GRAPH.add_nodes_from(np.arange(n_vectors))     # Add the nodes, each node represent a k point
-        
+        self.GRAPH.add_nodes_from(np.arange(n_vectors))  # Add the nodes, each node represent a k point
+
         ###########################################################################
         # Verify if any k point is a degenerate point
         ###########################################################################
         self.degenerados = []
+
         def obtain_degenerates(vectors: np.ndarray) -> list[Kpoint]:
-            '''
+            """
             Find all degenerate k points present on vectors.
 
             Parameters
                 vectors : array_like
                     An array with vector representation of k points.
-            
+
             Returns
                 degenerates : list[Kpoint]
                     It contains the degenerate points found.
-            '''
+            """
             degenerates = []
             for i, v in vectors:
-                degenerado = np.where(np.all(np.isclose(self.vectors[i+1:]-v, 0),
-                                    axis=1))[0] # Verify which points have numerically the same value
+                degenerado = np.where(np.all(np.isclose(self.vectors[i + 1 :] - v, 0), axis=1))[
+                    0
+                ]  # Verify which points have numerically the same value
                 if len(degenerado) > 0:
-                    self.logger.debug(f'Found degenerete point for {i}')
-                    degenerates += [[i, d+i+1] for d in degenerado]
+                    self.logger.debug(f"Found degenerete point for {i}")
+                    degenerates += [[i, d + i + 1] for d in degenerado]
             return degenerates
 
         # Parallelize the verification process
-        self.degenerados = self.parallelize('\tFinding degenerate points', obtain_degenerates, enumerate(self.vectors))
+        self.degenerados = self.parallelize("\tFinding degenerate points", obtain_degenerates, enumerate(self.vectors))
 
         if len(self.degenerados) > 0:
-            self.logger.debug('\tDegenerate Points: ')
+            self.logger.debug("\tDegenerate Points: ")
             for d in self.degenerados:
-                self.logger.debug(f'\t\t{d}')
+                self.logger.debug(f"\t\t{d}")
 
         self.ENERGIES = energies
 
@@ -913,13 +948,13 @@ class MATERIAL:
         #                one-step continuation (even in steep bands) is never cut.
         # NOTE: gap_scale collapses to the SOC splitting in noncollinear systems
         # (Kramers pairs), so it must NEVER be used as a sharp penalty width —
-        # only as a loose floor. 
+        # only as a loose floor.
         ###########################################################################
         gaps = np.diff(np.sort(self.eigenvalues, axis=1), axis=1)
         gaps = gaps[gaps > 0]
         self.gap_scale = float(np.median(gaps)) if gaps.size else 1.0
 
-        disp_values = []                                              # per-direction |dE| arrays, band axis kept
+        disp_values = []  # per-direction |dE| arrays, band axis kept
         neigh = np.asarray(self.neighbors)
         for j in range(neigh.shape[1]):
             nb = neigh[:, j]
@@ -931,7 +966,7 @@ class MATERIAL:
         disp_all = np.concatenate(disp_values, axis=0).ravel() if disp_values else np.array([])
         disp_scale = float(np.percentile(disp_all, 99.9)) if disp_all.size else 0.0
         self.disp_scale = disp_scale if disp_scale > 0 else self.gap_scale
-        self.sigma_min = 0.25 * self.gap_scale                          # min local-spread scale for _extrapolate_energy
+        self.sigma_min = 0.25 * self.gap_scale  # min local-spread scale for _extrapolate_energy
         self.accept_E = max(3.0 * self.disp_scale, 0.5 * self.gap_scale)  # gross-jump guard for repair/forced fills
 
         ###########################################################################
@@ -944,7 +979,7 @@ class MATERIAL:
         # near-degenerate regions keep the loose global scales (dp referees).
         ###########################################################################
         if disp_values:
-            band_steps = np.concatenate(disp_values, axis=0)            # (n_pairs, nbnd)
+            band_steps = np.concatenate(disp_values, axis=0)  # (n_pairs, nbnd)
             _band_p95 = np.percentile(band_steps, 95, axis=0)
             # Floor at the numerical-noise level (see DISP_NOISE_FLOOR): a flat
             # band's p95 step IS the noise, and sharpening onto it makes the
@@ -960,8 +995,7 @@ class MATERIAL:
         self.local_gap = np.full(self.eigenvalues.shape, np.inf)
         self.local_gap[:, :-1] = dE_adj
         self.local_gap[:, 1:] = np.minimum(self.local_gap[:, 1:], dE_adj)
-        _gate = np.minimum(self.accept_E,
-                           np.maximum(0.5 * self.local_gap, self.band_disp[None, :]))
+        _gate = np.minimum(self.accept_E, np.maximum(0.5 * self.local_gap, self.band_disp[None, :]))
         _resolved = self.local_gap > 2.0 * self.band_disp[None, :]
         # continuity_gate: per-(k, band) energy gate used ONLY by the cliff
         # machinery (_cliff_seam_edges detection, cliff-patch repair, the final
@@ -976,17 +1010,18 @@ class MATERIAL:
         # post-loop and confined to raw-band SWITCH edges.
         self.continuity_gate = np.where(_resolved, _gate, self.accept_E)
         n_sharp = int(np.sum(_resolved & (_gate < self.accept_E)))
-        self.logger.info(f'{BODY_INDENT}Local energy gates: {n_sharp}/{self.local_gap.size} '
-                         f'(k, band) cells sharpen below the global accept_E '
-                         f'(median sharpened gate '
-                         f'{np.median(_gate[_resolved & (_gate < self.accept_E)]):.4g} Ry)'
-                         if n_sharp else
-                         f'{BODY_INDENT}Local energy gates: no cell resolves its local gap '
-                         f'-- global scales everywhere')
-        self.logger.info(f'{BODY_INDENT}Dispersion noise floor: {DISP_NOISE_FLOOR:.4g} Ry, '
-                         f'{n_flat} flat band(s) floored'
-                         + (' (their p95 step is SCF noise, not dispersion)'
-                            if n_flat else ''))
+        self.logger.info(
+            f"{BODY_INDENT}Local energy gates: {n_sharp}/{self.local_gap.size} "
+            f"(k, band) cells sharpen below the global accept_E "
+            f"(median sharpened gate "
+            f"{np.median(_gate[_resolved & (_gate < self.accept_E)]):.4g} Ry)"
+            if n_sharp
+            else f"{BODY_INDENT}Local energy gates: no cell resolves its local gap -- global scales everywhere"
+        )
+        self.logger.info(
+            f"{BODY_INDENT}Dispersion noise floor: {DISP_NOISE_FLOOR:.4g} Ry, "
+            f"{n_flat} flat band(s) floored" + (" (their p95 step is SCF noise, not dispersion)" if n_flat else "")
+        )
 
         ###########################################################################
         # f(E) diagnostics, Tier 3: report the energy scales f(E) depends on, once.
@@ -1001,13 +1036,17 @@ class MATERIAL:
             d_max = float(disp_all.max())
         else:
             d_med = d_p95 = d_max = 0.0
-        gap_disp_ratio = (self.gap_scale / self.disp_scale) if self.disp_scale else float('inf')
-        self.logger.info(f'{BODY_INDENT}f(E) scales (Ry): gap_scale={self.gap_scale:.4g}  '
-                         f'disp_scale(p99.9)={self.disp_scale:.4g}  accept_E={self.accept_E:.4g}  '
-                         f'sigma_min={self.sigma_min:.4g}')
-        self.logger.info(f'{BODY_INDENT}f(E) single-step dispersion |E(k+1)-E(k)| (Ry): '
-                         f'median={d_med:.4g}  p95={d_p95:.4g}  max={d_max:.4g}  '
-                         f'(gap/disp={gap_disp_ratio:.3g})')
+        gap_disp_ratio = (self.gap_scale / self.disp_scale) if self.disp_scale else float("inf")
+        self.logger.info(
+            f"{BODY_INDENT}f(E) scales (Ry): gap_scale={self.gap_scale:.4g}  "
+            f"disp_scale(p99.9)={self.disp_scale:.4g}  accept_E={self.accept_E:.4g}  "
+            f"sigma_min={self.sigma_min:.4g}"
+        )
+        self.logger.info(
+            f"{BODY_INDENT}f(E) single-step dispersion |E(k+1)-E(k)| (Ry): "
+            f"median={d_med:.4g}  p95={d_p95:.4g}  max={d_max:.4g}  "
+            f"(gap/disp={gap_disp_ratio:.3g})"
+        )
         # fe_eweight: down-weight the f(E) score term when the gap has collapsed
         # below the single-step dispersion. In that regime (SOC/Kramers manifold,
         # gap_disp_ratio < 1) energy continuity simply CANNOT separate adjacent
@@ -1019,44 +1058,44 @@ class MATERIAL:
         # and the original f(E) weight is recovered exactly.
         self.fe_eweight = float(np.clip(gap_disp_ratio, 0.1, 1.0)) if np.isfinite(gap_disp_ratio) else 1.0
         if gap_disp_ratio < 1.0:
-            self.logger.warning(f'{BODY_INDENT}f(E) WARNING: gap_scale < disp_scale -- the band gap '
-                                f'looks collapsed (SOC/Kramers degeneracy?); down-weighting the f(E) '
-                                f'score term to fe_eweight={self.fe_eweight:.3g} and relying on the '
-                                f'dot product, with f(E) kept as a gross-jump gate at accept_E={self.accept_E:.4g}.')
+            self.logger.warning(
+                f"{BODY_INDENT}f(E) WARNING: gap_scale < disp_scale -- the band gap "
+                f"looks collapsed (SOC/Kramers degeneracy?); down-weighting the f(E) "
+                f"score term to fe_eweight={self.fe_eweight:.3g} and relying on the "
+                f"dot product, with f(E) kept as a gross-jump gate at accept_E={self.accept_E:.4g}."
+            )
 
         self.bands_final = np.full((self.nks, self.total_bands), -1, dtype=int)
 
     def get_neigs(self, i: Kpoint) -> list[Kpoint]:
-        '''
+        """
         Obtain the i's neighbors
 
         Parameters
             i : Kpoint
                 The node index.
-        
+
         Returns
             neighbors : list[Kpoint]
                 List with the nodes that are neighbors of the node i.
-        '''
+        """
         return list(self.GRAPH.neighbors(i))
 
-    def find_path(self, i: Kpoint, j:Kpoint) -> bool:
-        '''
+    def find_path(self, i: Kpoint, j: Kpoint) -> bool:
+        """
         Verify if exist a path between two k points inside the graph
 
         Parameters
             i : Kpoint
             j : Kpoint
-        
+
         Returns : bool
             If exists a path return True
-        '''
+        """
         neighs = self.get_neigs(i)
         neigh = neighs.pop(0) if len(neighs) > 0 else None
-        visited = [i] + [d for points in self.degenerados
-                         for d in points if d not in [i, j]]
-        while (neigh is not None and neigh != j and
-               (neigh not in visited or len(neighs) > 0)):
+        visited = [i] + [d for points in self.degenerados for d in points if d not in [i, j]]
+        while neigh is not None and neigh != j and (neigh not in visited or len(neighs) > 0):
             if neigh in visited:
                 neigh = neighs.pop(0)
                 continue
@@ -1068,7 +1107,7 @@ class MATERIAL:
         return neigh == j if neigh is not None else False
 
     def _grid_step_unit(self, k_ref: int, k_neighbor: int):
-        '''
+        """
         Unit step (per axis, on the k-space grid) pointing from ``k_ref`` toward
         ``k_neighbor``. Neighbours are adjacent grid points, so exactly one axis
         differs by +/-1. No periodic (BZ-wrapping) boundary is assumed: the
@@ -1080,16 +1119,17 @@ class MATERIAL:
                 idx_ref : grid index of k_ref
                 unit    : integer unit step per axis (a single axis is non-zero)
                 sizes   : number of k-points per axis
-        '''
+        """
         idx_ref = np.atleast_1d(np.asarray(self.kpoints_index[k_ref])).astype(int)
         idx_nb = np.atleast_1d(np.asarray(self.kpoints_index[k_neighbor])).astype(int)
-        sizes = np.array([self.nkx, self.nky, self.nkz][:self.dimensions], dtype=int)
+        sizes = np.array([self.nkx, self.nky, self.nkz][: self.dimensions], dtype=int)
         unit = np.sign(idx_nb - idx_ref).astype(int)
         return idx_ref, unit, sizes
 
-    def _extrapolate_energy(self, k_ref: int, k_neighbor: int, slot: int, N: int = 4,
-                            trusted: np.ndarray = None, same_band: bool = False):
-        '''
+    def _extrapolate_energy(
+        self, k_ref: int, k_neighbor: int, slot: int, N: int = 4, trusted: np.ndarray = None, same_band: bool = False
+    ):
+        """
         Predict the energy that band ``slot`` (in the current solution
         ``self.bands_final``) would have at ``k_neighbor`` by fitting a quadratic
         to its own trajectory at ``k_ref`` and the points behind it (away from the
@@ -1109,21 +1149,21 @@ class MATERIAL:
             (E_pred, sigma) : (float, float)
                 E_pred : extrapolated energy at ``k_neighbor``.
                 sigma  : local energy spread along the trajectory.
-        '''
+        """
         idx_ref, unit, sizes = self._grid_step_unit(k_ref, k_neighbor)
 
         Xs, Es = [], []
         b_anchor = None
-        for m in range(N):                                   # m=0 -> k_ref, m>0 -> behind it
+        for m in range(N):  # m=0 -> k_ref, m>0 -> behind it
             idx_b = idx_ref - m * unit
             if np.any(idx_b < 0) or np.any(idx_b >= sizes):
-                break                                        # stepped off the open k-mesh: stop
+                break  # stepped off the open k-mesh: stop
             kb = int(self.matrix[tuple(idx_b)]) if self.dimensions > 1 else int(self.matrix[idx_b[0]])
             b = self.bands_final[kb, slot]
             if b == -1:
-                continue                                     # unattributed: skip
+                continue  # unattributed: skip
             if trusted is not None and not trusted[kb, slot]:
-                continue                                     # suspect attribution: skip
+                continue  # suspect attribution: skip
             E_b = float(self.eigenvalues[kb, b])
             if Es:
                 # Cliff between this point and the last kept one -> stop the walk so the
@@ -1137,7 +1177,7 @@ class MATERIAL:
                 if abs(E_b - Es[-1]) > self.accept_E or (same_band and b != b_anchor):
                     break
             else:
-                b_anchor = b                                 # first kept point sets the reference band
+                b_anchor = b  # first kept point sets the reference band
             Xs.append(-m)
             Es.append(E_b)
 
@@ -1150,9 +1190,9 @@ class MATERIAL:
 
         sigma = max(float(np.std(Es)), self.sigma_min) if len(Es) > 1 else self.sigma_min
         if len(Es) < 3:
-            return float(Es[0]), sigma                       # nearest-neighbour energy fallback
-        w = _extrap_weights(tuple(Xs))                       # cached quadratic-extrapolation weights
-        E_pred = float(w @ np.asarray(Es))                   # predict one step forward (k_neighbor)
+            return float(Es[0]), sigma  # nearest-neighbour energy fallback
+        w = _extrap_weights(tuple(Xs))  # cached quadratic-extrapolation weights
+        E_pred = float(w @ np.asarray(Es))  # predict one step forward (k_neighbor)
         # Clip the one-step prediction to a local band window. A band cannot move
         # more than ~one (99.9-pct) dispersion step between adjacent k, so a larger
         # excursion is the quadratic overshooting -- the heavy error tail seen in the
@@ -1163,14 +1203,14 @@ class MATERIAL:
         return E_pred, sigma
 
     def _slot_reference_energy(self, k: int, slot: int) -> float:
-        '''
+        """
         Reference energy for (k, slot): the MEDIAN of one-step extrapolations taken
         from every attributed neighbour of k, each constrained (``same_band=True``)
         to the single band held at that neighbour -- so no direction's fit is ever
         taken across a band swap, and the points it uses are well attributed. The
         median makes the reference robust to a single bad direction. Falls back to
         the raw eigenvalue-ordering energy when no neighbour is attributed.
-        '''
+        """
         preds = []
         for k_nb in self.neighbors[k]:
             if k_nb == -1:
@@ -1184,26 +1224,25 @@ class MATERIAL:
         return float(self.eigenvalues[k, slot])
 
     def _local_accept(self, k: int, band: int) -> float:
-        '''
+        """
         Local gross-jump gate for candidate raw band ``band`` at k-point ``k``:
         half the local adjacent-band gap where it resolves the band's own
         dispersion, the loose global ``accept_E`` elsewhere (see _local_scales).
-        '''
-        if band < 0 or not hasattr(self, 'local_gap'):
+        """
+        if band < 0 or not hasattr(self, "local_gap"):
             return self.accept_E
-        gate, _ = _local_scales(self.accept_E, self.disp_scale,
-                                float(self.local_gap[k, band]),
-                                float(self.band_disp[band]))
+        gate, _ = _local_scales(
+            self.accept_E, self.disp_scale, float(self.local_gap[k, band]), float(self.band_disp[band])
+        )
         return gate
 
-    def _dp_affinity(self, k: int, slot: int, band: int,
-                     trusted: np.ndarray = None) -> Union[float, None]:
-        '''
+    def _dp_affinity(self, k: int, slot: int, band: int, trusted: np.ndarray = None) -> Union[float, None]:
+        """
         Mean dot product of raw band ``band`` at ``k`` to whatever band the SAME
         slot holds at the attributed (optionally trusted-only) neighbours -- the
         wavefunction evidence that ``band`` is this slot's continuation. Returns
         None when no neighbour provides evidence (caller treats dp as neutral).
-        '''
+        """
         vals = []
         for i_neig, k_nb in enumerate(self.neighbors[k]):
             if k_nb == -1:
@@ -1216,9 +1255,8 @@ class MATERIAL:
             vals.append(float(self.connections[k, i_neig, band, b2]))
         return float(np.mean(vals)) if vals else None
 
-    def _energy_outlier_mask(self, bad0: np.ndarray, min_support: int = 2,
-                             sigma_mult: float = 3.0) -> np.ndarray:
-        '''
+    def _energy_outlier_mask(self, bad0: np.ndarray, min_support: int = 2, sigma_mult: float = 3.0) -> np.ndarray:
+        """
         Flag trusted slots whose currently-assigned band is energy-discontinuous
         with the trajectory their TRUSTED neighbours predict, even though the solver
         never flagged them NOT/MIS.
@@ -1240,7 +1278,7 @@ class MATERIAL:
         Returns
             outlier : np.ndarray[bool], shape (nks, total_bands)
                 True where a trusted slot is energy-discontinuous with its neighbours.
-        '''
+        """
         trusted0 = (~bad0) & (self.bands_final != -1)
         outlier = np.zeros_like(bad0)
         for k in np.where(np.any(trusted0, axis=1))[0]:
@@ -1251,12 +1289,11 @@ class MATERIAL:
                 for k_nb in self.neighbors[k]:
                     if k_nb == -1 or not trusted0[k_nb, s]:
                         continue
-                    E_pred, sigma = self._extrapolate_energy(int(k_nb), int(k),
-                                                             int(s), trusted=trusted0)
+                    E_pred, sigma = self._extrapolate_energy(int(k_nb), int(k), int(s), trusted=trusted0)
                     preds.append(E_pred)
                     sigmas.append(sigma)
                 if len(preds) < min_support:
-                    continue                              # too few anchors to judge robustly
+                    continue  # too few anchors to judge robustly
                 pred = float(np.median(preds))
                 # Local gate instead of the flat accept_E floor: with the global
                 # floor a one-band jump inside a crowded manifold (gap < accept_E)
@@ -1271,7 +1308,7 @@ class MATERIAL:
         return outlier
 
     def _repair_energy_discontinuities(self, max_rounds: int = 64) -> np.ndarray:
-        '''
+        """
         A-posteriori energy-continuity repair of the solver's best solution.
 
         The clustering solution is taken as-is and ONLY the bad points are revisited;
@@ -1310,13 +1347,13 @@ class MATERIAL:
             repaired_mask : np.ndarray[bool], shape (nks, total_bands)
                 True where bands_final was reassigned (changed or newly attributed)
                 by this pass.
-        '''
+        """
         ###########################################################################
         # Bad = unattributed or energy-discontinuous in the best validation.
         # Degenerate points are basisrotation's job: never freed, never reassigned.
         ###########################################################################
         bad = self.bands_final == -1
-        validation = getattr(self, 'correct_signalfinal_best', None)
+        validation = getattr(self, "correct_signalfinal_best", None)
         if validation is not None:
             bad |= (validation == NOT_SOLVED) | (validation == MISTAKE)
             bad &= validation != DEGENERATE
@@ -1333,8 +1370,10 @@ class MATERIAL:
         bad &= self.signal_final != DEGENERATE
         n_outlier = int(np.sum(bad)) - n_signal_bad
         if n_outlier:
-            self.logger.info(f'{BODY_INDENT}Energy-outlier widening: {n_outlier} '
-                             f'additional energy-discontinuous slot(s) flagged for repair')
+            self.logger.info(
+                f"{BODY_INDENT}Energy-outlier widening: {n_outlier} "
+                f"additional energy-discontinuous slot(s) flagged for repair"
+            )
 
         trusted = (~bad) & (self.bands_final != -1)
         repaired_mask = np.zeros_like(bad)
@@ -1362,13 +1401,14 @@ class MATERIAL:
                 valid = nb != -1
                 support_pts[valid] += trusted[nb[valid]]
             support = np.sum(support_pts * bad, axis=1)[ks_bad]
-            order = np.argsort(-support, kind='stable')
+            order = np.argsort(-support, kind="stable")
             progress = 0
             for idx in order:
                 if support[idx] == 0:
-                    break                                   # the rest have no anchor this round
+                    break  # the rest have no anchor this round
                 k = int(ks_bad[idx])
                 bad_slots = np.where(bad[k])[0]
+
                 ###########################################################################
                 # Free all bad slots at k, CO-FREEING its OTHER/FOR cells (see the
                 # docstring: they are the trusted cycle partners locking the bands the
@@ -1377,19 +1417,23 @@ class MATERIAL:
                 # Predicted (reference) energy per slot, from every direction whose
                 # nearest neighbour is trusted in that slot; median for robustness.
                 def _slot_ref(s):
-                    preds = [self._extrapolate_energy(k_nb, k, int(s), trusted=trusted)[0]
-                             for k_nb in self.neighbors[k]
-                             if k_nb != -1 and trusted[k_nb, s]]
+                    preds = [
+                        self._extrapolate_energy(k_nb, k, int(s), trusted=trusted)[0]
+                        for k_nb in self.neighbors[k]
+                        if k_nb != -1 and trusted[k_nb, s]
+                    ]
                     return float(np.median(preds)) if preds else None
 
                 bad_refs = [_slot_ref(s) for s in bad_slots]
 
                 co = np.zeros(self.total_bands, dtype=bool)
                 if validation is not None:
-                    co = (((validation[k] == POTENTIAL_MISTAKE) |
-                           (validation[k] == FORCED_CONTINUITY)) &
-                          ~bad[k] & (self.bands_final[k] != -1) &
-                          (self.signal_final[k] != DEGENERATE))
+                    co = (
+                        ((validation[k] == POTENTIAL_MISTAKE) | (validation[k] == FORCED_CONTINUITY))
+                        & ~bad[k]
+                        & (self.bands_final[k] != -1)
+                        & (self.signal_final[k] != DEGENERATE)
+                    )
                     if co.any():
                         # Energy window: a cycle partner's held band must lie within the
                         # gross-jump gate of a bad slot's held band (the band the partner
@@ -1406,8 +1450,7 @@ class MATERIAL:
                             anchors = np.asarray(anchors, dtype=float)
                             co_idx = np.where(co)[0]
                             co_E = self.eigenvalues[k, self.bands_final[k, co_idx]]
-                            near = np.min(np.abs(co_E[:, None] - anchors[None, :]),
-                                          axis=1) <= self.accept_E
+                            near = np.min(np.abs(co_E[:, None] - anchors[None, :]), axis=1) <= self.accept_E
                             co[co_idx[~near]] = False
                         else:
                             co[:] = False
@@ -1434,7 +1477,7 @@ class MATERIAL:
                 # gross-jump gate of the candidate band (half the local adjacent gap
                 # in a resolved manifold, the loose global accept_E elsewhere). In a
                 # crowded manifold the global gate admits 2-4 adjacent bands, and the
-                # old energy-nearest choice was character-blind. 
+                # old energy-nearest choice was character-blind.
                 # The dot product to the trusted same-slot neighbours now
                 # picks among the energy-admissible candidates.
                 ###########################################################################
@@ -1448,7 +1491,7 @@ class MATERIAL:
                             gate = self._local_accept(k, int(b))
                             resid = abs(avail_E[col] - refs[i])
                             if resid > gate:
-                                continue                    # across a local energy wall
+                                continue  # across a local energy wall
                             dp_aff = self._dp_affinity(k, s, int(b), trusted)
                             dp_term = (1.0 - dp_aff) if dp_aff is not None else 0.5
                             cost[row, col] = REPAIR_W_E * (resid / gate) + REPAIR_W_DP * dp_term
@@ -1456,7 +1499,7 @@ class MATERIAL:
                     taken = []
                     for r_, c_ in zip(rows_, cols_):
                         if cost[r_, c_] >= BIG:
-                            continue                        # only inadmissible pairings left
+                            continue  # only inadmissible pairings left
                         self.bands_final[k, int(free_slots[pred_idx[r_]])] = available[c_]
                         taken.append(c_)
                     for c_ in sorted(taken, reverse=True):
@@ -1492,11 +1535,12 @@ class MATERIAL:
                                 nb_ = int(self.bands_final[k, s])
                                 rE = refs[i]
                                 self.logger.debug(
-                                    f'{BODY_INDENT}  [repair] k={k} slot={s}'
-                                    f'{"" if genuine else " (co-freed)"}: '
-                                    f'band {int(original[i])}->{nb_}  '
-                                    f'E={float(self.eigenvalues[k, nb_]):.4f}  '
-                                    f'refE={("%.4f" % rE) if rE is not None else "n/a"}  round={round_ + 1}')
+                                    f"{BODY_INDENT}  [repair] k={k} slot={s}"
+                                    f"{'' if genuine else ' (co-freed)'}: "
+                                    f"band {int(original[i])}->{nb_}  "
+                                    f"E={float(self.eigenvalues[k, nb_]):.4f}  "
+                                    f"refE={('%.4f' % rE) if rE is not None else 'n/a'}  round={round_ + 1}"
+                                )
                     elif original[i] != -1 and original[i] in available:
                         # Failed: restore the original attribution (stays flagged) so
                         # the FORCED count is not inflated; it may be repaired later.
@@ -1512,15 +1556,17 @@ class MATERIAL:
                         bad[k, s] = True
                         trusted[k, s] = False
 
-            self.logger.debug(f'\t\tRepair round {round_ + 1}: {progress} point(s) re-anchored')
+            self.logger.debug(f"\t\tRepair round {round_ + 1}: {progress} point(s) re-anchored")
             if progress == 0:
                 break
 
         n_left = int(np.sum(bad))
-        self.logger.info(f'{BODY_INDENT}Energy repair: {n_bad_initial} flagged point(s), '
-                         f'{n_repaired} reassigned ({n_co_moved} co-freed OTHER/FOR '
-                         f'cycle partner(s) among them), {n_left} not repairable '
-                         f'(kept original attribution or left for the completeness pass)')
+        self.logger.info(
+            f"{BODY_INDENT}Energy repair: {n_bad_initial} flagged point(s), "
+            f"{n_repaired} reassigned ({n_co_moved} co-freed OTHER/FOR "
+            f"cycle partner(s) among them), {n_left} not repairable "
+            f"(kept original attribution or left for the completeness pass)"
+        )
 
         ###########################################################################
         # Re-derive the dot-product signal of every re-anchored point (its band or
@@ -1544,7 +1590,7 @@ class MATERIAL:
         return repaired_mask
 
     def _force_complete_bands(self) -> np.ndarray:
-        '''
+        """
         Force a genuine band attribution for every k-point/slot the clustering
         left unattributed (-1). For each k-point, the bands not used by any
         attributed slot ("available") are jointly assigned to the empty slots by
@@ -1557,8 +1603,8 @@ class MATERIAL:
         Returns
             forced_mask : np.ndarray[bool], shape (nks, total_bands)
                 True where bands_final was force-filled by this pass.
-        '''
-        forced_mask = (self.bands_final == -1)
+        """
+        forced_mask = self.bands_final == -1
         all_bands = np.arange(self.total_bands)
         for k in range(self.nks):
             empty_slots = np.where(forced_mask[k])[0]
@@ -1585,8 +1631,7 @@ class MATERIAL:
                         resid = abs(avail_E[col] - refs[row])
                         dp_aff = self._dp_affinity(k, int(s), int(b))
                         dp_term = (1.0 - dp_aff) if dp_aff is not None else 0.5
-                        cost[row, col] = (REPAIR_W_E * min(resid / gate, 10.0)
-                                          + REPAIR_W_DP * dp_term)
+                        cost[row, col] = REPAIR_W_E * min(resid / gate, 10.0) + REPAIR_W_DP * dp_term
                 rows_, cols_ = linear_sum_assignment(cost)
                 for r_, c_ in zip(rows_, cols_):
                     s = int(empty_slots[r_])
@@ -1594,27 +1639,30 @@ class MATERIAL:
                     self.bands_final[k, s] = chosen
                     if self.logger.level <= logging.DEBUG:
                         dE = abs(avail_E[c_] - refs[r_])
-                        self.logger.debug(f'{BODY_INDENT}  [forced] k={k} slot={s}: '
-                                          f'-1->band {chosen}  E={float(self.eigenvalues[k, chosen]):.4f}  '
-                                          f'refE={float(refs[r_]):.4f}  |dE|={dE:.4f}')
+                        self.logger.debug(
+                            f"{BODY_INDENT}  [forced] k={k} slot={s}: "
+                            f"-1->band {chosen}  E={float(self.eigenvalues[k, chosen]):.4f}  "
+                            f"refE={float(refs[r_]):.4f}  |dE|={dE:.4f}"
+                        )
             for s in empty_slots:
                 s = int(s)
                 if self.bands_final[k, s] == -1:
-                    self.bands_final[k, s] = s          # last resort (permutation defect)
+                    self.bands_final[k, s] = s  # last resort (permutation defect)
                     if self.logger.level <= logging.DEBUG:
-                        self.logger.debug(f'{BODY_INDENT}  [forced] k={k} slot={s}: '
-                                          f'no band available -> last-resort band {s}')
+                        self.logger.debug(
+                            f"{BODY_INDENT}  [forced] k={k} slot={s}: no band available -> last-resort band {s}"
+                        )
         return forced_mask
 
     def _nn_energy_jump_map(self) -> np.ndarray:
-        '''
+        """
         Per (k, slot) the largest |E(k, slot) - E(neighbour, slot)| over the slot's
         attributed in-BZ neighbours (slot-correct namespace: the energy of whatever
         band each slot holds). NaN where the slot is unattributed or has no attributed
         neighbour. This is the diagnostic that exposes silent mis-attributions: a slot
         sitting on a gross energy wall relative to its own neighbours, even when the
         validation flag marks it solved. Used only by the verbose provenance log.
-        '''
+        """
         nks, nb = self.bands_final.shape
         jumps = np.full((nks, nb), np.nan)
         neigh = np.asarray(self.neighbors)
@@ -1637,7 +1685,7 @@ class MATERIAL:
         return jumps
 
     def _log_solution_provenance(self, inloop_bands: np.ndarray, inloop_csf: np.ndarray) -> None:
-        '''
+        """
         Verbose (-v / DEBUG) post-mortem of the final solution. For every slot it
         reports where its value came from -- solved IN-LOOP by the clustering, REPAIRED
         by the a-posteriori energy-continuity pass, or FORCE-FILLED by the completeness
@@ -1656,18 +1704,17 @@ class MATERIAL:
         Skipped unless the logger is at DEBUG level, since it scans every (k, slot).
         Takes the in-loop best (bands + validation) snapshotted before the post-loop
         passes ran.
-        '''
+        """
         if self.logger.level > logging.DEBUG:
             return
-        CSF_SOLVED = 3          # correct_signalfinal: >=3 (OTHER/CORRECT/FORCED_CONT) == "solved/reported-OK"
-        CSF_NAME = {0: 'NOT_SOLVED', 1: 'MISTAKE', 2: 'DEGENERATE',
-                    3: 'OTHER', 4: 'CORRECT', 5: 'FORCED_CONT'}
+        CSF_SOLVED = 3  # correct_signalfinal: >=3 (OTHER/CORRECT/FORCED_CONT) == "solved/reported-OK"
+        CSF_NAME = {0: "NOT_SOLVED", 1: "MISTAKE", 2: "DEGENERATE", 3: "OTHER", 4: "CORRECT", 5: "FORCED_CONT"}
         nks, nb = self.bands_final.shape
         csf = self.correct_signalfinal
-        repaired = getattr(self, 'repaired_mask', None)
+        repaired = getattr(self, "repaired_mask", None)
         if repaired is None:
             repaired = np.zeros((nks, nb), bool)
-        forced = getattr(self, 'forced_mask', None)
+        forced = getattr(self, "forced_mask", None)
         if forced is None:
             forced = np.zeros((nks, nb), bool)
         jumps = self._nn_energy_jump_map()
@@ -1675,16 +1722,18 @@ class MATERIAL:
 
         def prov(k: int, s: int) -> str:
             if forced[k, s]:
-                return 'FORCED'
+                return "FORCED"
             if repaired[k, s]:
-                return 'REPAIRED'
+                return "REPAIRED"
             if inloop_csf[k, s] >= CSF_SOLVED:
-                return 'IN-LOOP'
-            return 'IN-LOOP(flag)'
+                return "IN-LOOP"
+            return "IN-LOOP(flag)"
 
-        self.logger.debug('\n\t\t==================== SOLUTION PROVENANCE & HEALTH (verbose) ===================='
-                          f'\n\t\tgross-jump threshold accept_E = {gross:.4f} Ry')
-        self.logger.debug('\t\tslot | in-loop  repaired  forced | csf<3(fail) | SILENT-DISC(csf>=3 & jump>accept_E)')
+        self.logger.debug(
+            "\n\t\t==================== SOLUTION PROVENANCE & HEALTH (verbose) ===================="
+            f"\n\t\tgross-jump threshold accept_E = {gross:.4f} Ry"
+        )
+        self.logger.debug("\t\tslot | in-loop  repaired  forced | csf<3(fail) | SILENT-DISC(csf>=3 & jump>accept_E)")
         for s in range(nb):
             kept_flag = ((inloop_csf[:, s] < CSF_SOLVED) & ~repaired[:, s] & ~forced[:, s]).sum()
             n_inloop = ((inloop_csf[:, s] >= CSF_SOLVED) & ~repaired[:, s] & ~forced[:, s]).sum()
@@ -1693,42 +1742,50 @@ class MATERIAL:
             n_fail = (csf[:, s] < CSF_SOLVED).sum()
             col_jump = jumps[:, s]
             n_silent = ((csf[:, s] >= CSF_SOLVED) & (col_jump > gross)).sum()
-            self.logger.debug(f'\t\t{s:4d} | {int(n_inloop):7d} {int(n_rep):9d} {int(n_forced):7d} | '
-                              f'{int(n_fail):11d} | {int(n_silent):d}'
-                              + (f'   (+{int(kept_flag)} in-loop slots kept though flagged)' if kept_flag else ''))
+            self.logger.debug(
+                f"\t\t{s:4d} | {int(n_inloop):7d} {int(n_rep):9d} {int(n_forced):7d} | "
+                f"{int(n_fail):11d} | {int(n_silent):d}"
+                + (f"   (+{int(kept_flag)} in-loop slots kept though flagged)" if kept_flag else "")
+            )
 
         # 2. Post-loop swaps (band changed vs the in-loop best solution).
         sk, ss = np.where(inloop_bands != self.bands_final)
-        self.logger.debug(f'\n\t\t==================== POST-LOOP SLOT SWAPS: {len(sk)} ====================')
+        self.logger.debug(f"\n\t\t==================== POST-LOOP SLOT SWAPS: {len(sk)} ====================")
         if len(sk):
-            self.logger.debug('\t\t    k  slot  band(in->out)   E(in->out) [Ry]      nn-jump  provenance     final-csf')
+            self.logger.debug("\t\t    k  slot  band(in->out)   E(in->out) [Ry]      nn-jump  provenance     final-csf")
             for k, s in sorted(zip(sk.tolist(), ss.tolist())):
                 ob, nbd = int(inloop_bands[k, s]), int(self.bands_final[k, s])
-                oE = float(self.eigenvalues[k, ob]) if ob >= 0 else float('nan')
-                nE = float(self.eigenvalues[k, nbd]) if nbd >= 0 else float('nan')
+                oE = float(self.eigenvalues[k, ob]) if ob >= 0 else float("nan")
+                nE = float(self.eigenvalues[k, nbd]) if nbd >= 0 else float("nan")
                 jv = jumps[k, s]
-                self.logger.debug(f'\t\t{k:5d} {s:4d}   {ob:3d}->{nbd:<3d}      {oE:8.4f}->{nE:<8.4f}   '
-                                  f'{(jv if not np.isnan(jv) else -1):8.4f}  {prov(k, s):13s}  '
-                                  f'{CSF_NAME.get(int(csf[k, s]), int(csf[k, s]))}')
+                self.logger.debug(
+                    f"\t\t{k:5d} {s:4d}   {ob:3d}->{nbd:<3d}      {oE:8.4f}->{nE:<8.4f}   "
+                    f"{(jv if not np.isnan(jv) else -1):8.4f}  {prov(k, s):13s}  "
+                    f"{CSF_NAME.get(int(csf[k, s]), int(csf[k, s]))}"
+                )
 
         # 3. Silent discontinuities: pass validation but jump > accept_E, worst first.
         hk, hs = np.where((csf >= CSF_SOLVED) & (jumps > gross))
-        self.logger.debug(f'\n\t\t==================== SILENT DISCONTINUITIES (pass validation, '
-                          f'jump>accept_E): {len(hk)} ====================')
+        self.logger.debug(
+            f"\n\t\t==================== SILENT DISCONTINUITIES (pass validation, "
+            f"jump>accept_E): {len(hk)} ===================="
+        )
         if len(hk):
-            self.logger.debug('\t\t    k  slot  band     E [Ry]    nn-jump  provenance     in-loop-band  final-csf')
+            self.logger.debug("\t\t    k  slot  band     E [Ry]    nn-jump  provenance     in-loop-band  final-csf")
             order = np.argsort(-jumps[hk, hs])
             for i in order:
                 k, s = int(hk[i]), int(hs[i])
                 b = int(self.bands_final[k, s])
                 ib = int(inloop_bands[k, s])
-                self.logger.debug(f'\t\t{k:5d} {s:4d}  {b:4d}  {float(self.eigenvalues[k, b]):8.4f}  '
-                                  f'{jumps[k, s]:8.4f}  {prov(k, s):13s}  {ib:11d}   '
-                                  f'{CSF_NAME.get(int(csf[k, s]), int(csf[k, s]))}')
-        self.logger.debug('\t\t===============================================================================\n')
+                self.logger.debug(
+                    f"\t\t{k:5d} {s:4d}  {b:4d}  {float(self.eigenvalues[k, b]):8.4f}  "
+                    f"{jumps[k, s]:8.4f}  {prov(k, s):13s}  {ib:11d}   "
+                    f"{CSF_NAME.get(int(csf[k, s]), int(csf[k, s]))}"
+                )
+        self.logger.debug("\t\t===============================================================================\n")
 
-    def make_connections(self, tol:float=0.80, not_first_iteration:bool=False, node_subset=None) -> None:
-        '''
+    def make_connections(self, tol: float = 0.80, not_first_iteration: bool = False, node_subset=None) -> None:
+        """
         This function evaluates the connection between each k point,
         and adds an edge to the graph if its connection is greater
         than a tolerance value (tol).
@@ -1745,12 +1802,12 @@ class MATERIAL:
                 is still created). Used by the error-region-only rebuild so the
                 good bands keep just their continuity edges and are not re-clustered.
                 default: None (every node, i.e. the full graph)
-        '''
+        """
         ###########################################################################
         # Find the edges on the graph
         ###########################################################################
         self.tol = tol
-        tol = 1 - 2/np.pi * np.arccos(tol) # Convert the tolerance value to arccos metric
+        tol = 1 - 2 / np.pi * np.arccos(tol)  # Convert the tolerance value to arccos metric
 
         ###########################################################################
         # Edges are built from the dot product ALONE. Energy continuity is NOT
@@ -1759,8 +1816,8 @@ class MATERIAL:
         # a posteriori instead, by _repair_energy_discontinuities at the end of
         # solve(), which only ever touches flagged points.
         ###########################################################################
-        def connection_component(vectors:np.ndarray) -> list[list[Kpoint]]:
-            '''
+        def connection_component(vectors: np.ndarray) -> list[list[Kpoint]]:
+            """
             Find the possible edges in the graph using the information of dot product.
 
             Parameters
@@ -1770,26 +1827,25 @@ class MATERIAL:
             Returns
                 edges : list[list[Kpoint]]
                     List of all edges that was found.
-            '''
+            """
             edges = []
             bands = np.repeat(np.arange(0, self.nbnd), self.number_neighbors)
             for i_ in vectors:
-                bn1 = i_//self.nks  # bi
+                bn1 = i_ // self.nks  # bi
                 k1 = i_ % self.nks
                 neighs = np.tile(self.neighbors[k1], self.nbnd)
-                ks = neighs + bands*self.nks
+                ks = neighs + bands * self.nks
                 ks = ks[neighs != -1]
                 for j_ in ks:
                     k2 = j_ % self.nks
-                    bn2 = j_//self.nks  # bj
+                    bn2 = j_ // self.nks  # bj
                     i_neig = int(np.where(self.neighbors[k1] == k2)[0][0])
-                    connection = float(self.connections[k1, i_neig,
-                                                    bn1, bn2])  # <i|j>
-                    '''
+                    connection = float(self.connections[k1, i_neig, bn1, bn2])  # <i|j>
+                    """
                     for each first neighbor
                     Edge(i,j) = 1 iff <i, j> ~ 1
-                    '''
-                    connection = 1 - 2/np.pi * np.arccos(connection)
+                    """
+                    connection = 1 - 2 / np.pi * np.arccos(connection)
                     if connection <= tol:
                         continue
                     # Cross-band guard (anti-bridge). A cross-band edge (bn1 != bn2)
@@ -1804,24 +1860,23 @@ class MATERIAL:
                     # the same band stays strong cannot disconnect a band from its own
                     # chain; genuine crossings (same-band overlap collapsed) are kept.
                     if bn1 != bn2:
-                        same = float(self.connections[k1, i_neig, bn1, bn1])   # <bn1@k1|bn1@k2>
-                        same = 1 - 2/np.pi * np.arccos(same)
+                        same = float(self.connections[k1, i_neig, bn1, bn1])  # <bn1@k1|bn1@k2>
+                        same = 1 - 2 / np.pi * np.arccos(same)
                         if same > tol:
                             continue
                     edges.append([i_, j_, connection])  # Add the weighted edge
             return edges
 
-        self.logger.info(f'\t\tTolerance: {tol}')
+        self.logger.info(f"\t\tTolerance: {tol}")
         # Parallelize the edges calculation (over every node, or just the subset
         # when an error-region rebuild restricts which nodes originate edges).
         nodes_iter = range(len(self.vectors)) if node_subset is None else list(node_subset)
-        edges = self.parallelize('\t\tComputing Edges', connection_component, nodes_iter)
+        edges = self.parallelize("\t\tComputing Edges", connection_component, nodes_iter)
         # Establish the edges on the graph from edges array
         self.GRAPH.add_weighted_edges_from(edges)
 
         if not_first_iteration:
             return
-
 
         ###########################################################################
         # Solve problems that a degenerate point may cause
@@ -1829,10 +1884,10 @@ class MATERIAL:
         degnerates = []
         problems = []
         for d1, d2 in self.degenerados:
-            '''
+            """
             The degenerate points may cause problems.
             The algorithm below finds its problems and solves them.
-            '''
+            """
             flag = False
             if not self.find_path(d1, d2):
                 # Verify if exist a path that connects two forbidden points
@@ -1846,10 +1901,10 @@ class MATERIAL:
             if len(N1) == 0 or len(N2) == 0:
                 continue
             problem = {
-                d1 : N1,
-                d2 : N2,
+                d1: N1,
+                d2: N2,
             }
-            self.logger.debug(f'\tProblem:\n\t{d1}: {N1}\n\t{d2}: {N2}\n')
+            self.logger.debug(f"\tProblem:\n\t{d1}: {N1}\n\t{d2}: {N2}\n")
             NKS = self.nks
             if len(N1) > 1 and len(N2) > 1:
                 N = []
@@ -1872,32 +1927,24 @@ class MATERIAL:
                     if len(n2_idx[0]) == 0:
                         continue
                     n2_index = n2_idx[0][0]
-                    N = [[N_1[0], N_2[n2_index]]] \
-                        + [[n] for n in N_2 if n != N_2[n2_index]]
+                    N = [[N_1[0], N_2[n2_index]]] + [[n] for n in N_2 if n != N_2[n2_index]]
                     flag = True
             # Assign to a specific band each point and establish the corresponding edges
             n1 = np.random.choice(N[0])
             if flag:
                 N1_ = [n1]
-                N2_ = [N[0][np.argmax(np.abs(N[0]-n1))]]
+                N2_ = [N[0][np.argmax(np.abs(N[0] - n1))]]
                 n2 = N2_[0]
                 Ns = [N1_, N2_]
                 for n in N[1:]:
                     n = n[0]
                     Ns[np.argmin(np.abs(np.array([n1, n2]) - n))].append(n)
             else:
-                N1_ = [n[np.argmin(np.abs(n-n1))] for n in N]
-                N2_ = [n[np.argmax(np.abs(n-n1))] for n in N]
-            solution = {
-                d1 : N1_,
-                d2 : N2_
-            }
-            problems.append({
-                'points' : [d1, d2],
-                'problem' : problem,
-                'solution' : solution
-            })
-            self.logger.debug(f'\tSolution:\n\t{d1}: {N1_}\n\t{d2}: {N2_}\n')
+                N1_ = [n[np.argmin(np.abs(n - n1))] for n in N]
+                N2_ = [n[np.argmax(np.abs(n - n1))] for n in N]
+            solution = {d1: N1_, d2: N2_}
+            problems.append({"points": [d1, d2], "problem": problem, "solution": solution})
+            self.logger.debug(f"\tSolution:\n\t{d1}: {N1_}\n\t{d2}: {N2_}\n")
             for k in N1:
                 self.GRAPH.remove_edge(k, d1)
             for k in N2:
@@ -1907,58 +1954,72 @@ class MATERIAL:
                 self.GRAPH.add_edge(k, d1)
             for k in N2_:
                 self.GRAPH.add_edge(k, d2)
-        
+
         self.degenerates = np.array(degnerates)
 
         ###########################################################################
         # Show the degenerate points that causes problems
         ###########################################################################
-        self.solved_problems_info : list[str, list] = ['', []]
-        forbidden_points = '''\n\t\t  ''' + textwrap.fill(
-            'A forbidden path indicates that a specific k-point was identified as degenerate. However, this k-point establishes a connection between two distinct bands, culminating in the k-point having a link with the same k-point in a different band—an arrangement that is not allowed.',
-            width=110,
-            subsequent_indent='\t\t  '
-        ) + '\n'
+        self.solved_problems_info: list[str, list] = ["", []]
+        forbidden_points = (
+            """\n\t\t  """
+            + textwrap.fill(
+                "A forbidden path indicates that a specific k-point was identified as degenerate. However, this k-point establishes a connection between two distinct bands, culminating in the k-point having a link with the same k-point in a different band—an arrangement that is not allowed.",
+                width=110,
+                subsequent_indent="\t\t  ",
+            )
+            + "\n"
+        )
 
-        self.solved_problems_info[0] = '\n\t\tThe number of points with forbidden paths between them is: ' + str(len(problems))
-        self.solved_problems_info[0] += '\n\t' + forbidden_points
+        self.solved_problems_info[0] = "\n\t\tThe number of points with forbidden paths between them is: " + str(
+            len(problems)
+        )
+        self.solved_problems_info[0] += "\n\t" + forbidden_points
         if len(problems) > 0:
-            self.solved_problems_info[0] += '\n\t\t  Problems in points:'
-            self.logger.info('\t*** Points with forbidden paths found and solved ***')
+            self.solved_problems_info[0] += "\n\t\t  Problems in points:"
+            self.logger.info("\t*** Points with forbidden paths found and solved ***")
             self.logger.info(forbidden_points)
-            self.logger.info('\t    The problems and their solutions are:')
-        
-        calc_k_bn = lambda p: (p % self.nks, p // self.nks )
+            self.logger.info("\t    The problems and their solutions are:")
+
+        calc_k_bn = lambda p: (p % self.nks, p // self.nks)
         for problem_dic in problems:
-            d1, d2 = problem_dic['points']
-            problem = problem_dic['problem']
-            solution = problem_dic['solution']
-            self.logger.info(f'\t    * Problem:')
+            d1, d2 = problem_dic["points"]
+            problem = problem_dic["problem"]
+            solution = problem_dic["solution"]
+            self.logger.info("\t    * Problem:")
             k1, bn1 = calc_k_bn(d1)
             _, bn2 = calc_k_bn(d2)
             self.solved_problems_info[1].append([d1, d2])
-            self.logger.info(f'\n\t\tK-point: {k1} in bands: {bn1}, {bn2}')
-            self.logger.info(f'\t\t   k: {k1}, band: {bn1} has edges with:')
+            self.logger.info(f"\n\t\tK-point: {k1} in bands: {bn1}, {bn2}")
+            self.logger.info(f"\t\t   k: {k1}, band: {bn1} has edges with:")
             for k, bn in map(calc_k_bn, problem[d1]):
-                self.logger.info(f'\t\t    k: {k} bn: {bn}')
-            self.logger.info(f'\t\t   k: {k1}, band: {bn2} has edges with:')
+                self.logger.info(f"\t\t    k: {k} bn: {bn}")
+            self.logger.info(f"\t\t   k: {k1}, band: {bn2} has edges with:")
             for k, bn in map(calc_k_bn, problem[d2]):
-                self.logger.info(f'\t\t    k: {k} bn: {bn}')
-            self.logger.info(f'\n\t      Solution:')
-            self.logger.info(f'\t\t   k: {k1}, band: {bn1} has edges with:')
+                self.logger.info(f"\t\t    k: {k} bn: {bn}")
+            self.logger.info("\n\t      Solution:")
+            self.logger.info(f"\t\t   k: {k1}, band: {bn1} has edges with:")
             for k, bn in map(calc_k_bn, solution[d1]):
-                self.logger.info(f'\t\t    k: {k} bn: {bn}')
-            self.logger.info(f'\t\t   k: {k1}, band: {bn2} has edges with:')
+                self.logger.info(f"\t\t    k: {k} bn: {bn}")
+            self.logger.info(f"\t\t   k: {k1}, band: {bn2} has edges with:")
             for k, bn in map(calc_k_bn, solution[d2]):
-                self.logger.info(f'\t\t    k: {k} bn: {bn}')
+                self.logger.info(f"\t\t    k: {k} bn: {bn}")
 
         if len(problems) > 0:
-            self.logger.info('\n\t    Note that this solution may be wrong \n\t    but next iterations will correct it.\n')
+            self.logger.info(
+                "\n\t    Note that this solution may be wrong \n\t    but next iterations will correct it.\n"
+            )
 
-            
-
-    def parallelize(self, process_name: str, f: Callable, iterator: Union[list, np.ndarray], per_actual:int=0, N_total:int=None,*args) -> np.ndarray:
-        '''
+    def parallelize(
+        self,
+        process_name: str,
+        f: Callable,
+        iterator: Union[list, np.ndarray],
+        per_actual: int = 0,
+        N_total: int = None,
+        *args,
+    ) -> np.ndarray:
+        """
         Apply the function f to an iterator in parallel using a process Pool.
 
         The iterator is split into one chunk per worker. Each chunk is processed
@@ -1989,7 +2050,7 @@ class MATERIAL:
             result : list
                 It contains the result for each value inside the iterator,
                 concatenated in input order.
-        '''
+        """
         global _PARALLEL_FN, _PARALLEL_ARGS
 
         iterator = list(iterator)
@@ -1998,7 +2059,9 @@ class MATERIAL:
         ###########################################################################
         # Debug information and Progress bar
         ###########################################################################
-        self.logger.debug(f'Starting Parallelization for {process_name} with {len(iterator)} values. Number of processes: {self.n_process}. Starting at {per_actual}/{N_total}')
+        self.logger.debug(
+            f"Starting Parallelization for {process_name} with {len(iterator)} values. Number of processes: {self.n_process}. Starting at {per_actual}/{N_total}"
+        )
         self.logger.percent_complete(per_actual, N, title=process_name)
 
         def finish_progress():
@@ -2017,7 +2080,7 @@ class MATERIAL:
         ###########################################################################
         n_proc = max(1, min(self.n_process, len(iterator)))
         chunk_size = (len(iterator) + n_proc - 1) // n_proc
-        chunks = [iterator[i:i + chunk_size] for i in range(0, len(iterator), chunk_size)]
+        chunks = [iterator[i : i + chunk_size] for i in range(0, len(iterator), chunk_size)]
 
         # Publish the worker function so the forked Pool workers reach it (and
         # the large read-only arrays it closes over) via copy-on-write, without
@@ -2042,15 +2105,15 @@ class MATERIAL:
                 # mid-chunk, executor.map raises BrokenProcessPool rather than blocking
                 # the parent forever.  The workers are forked after _PARALLEL_FN is
                 # published above, so they still inherit it via copy-on-write.
-                with ProcessPoolExecutor(max_workers=n_proc, mp_context=get_context('fork')) as executor:
+                with ProcessPoolExecutor(max_workers=n_proc, mp_context=get_context("fork")) as executor:
                     try:
                         for chunk, value in zip(chunks, executor.map(_parallel_dispatch, chunks)):
                             if value:
-                                result += value                                  # Store the output into result array
-                            done += len(chunk)                                   # The counter is actualized
+                                result += value  # Store the output into result array
+                            done += len(chunk)  # The counter is actualized
                             self.logger.percent_complete(done, N, title=process_name)
                     except BrokenProcessPool:
-                        self.logger.error('A clustering worker process died without returning a result.')
+                        self.logger.error("A clustering worker process died without returning a result.")
                         raise
         finally:
             _PARALLEL_FN = None
@@ -2060,7 +2123,7 @@ class MATERIAL:
         return result
 
     def _log_fE_stats(self, stats: dict) -> None:
-        '''
+        """
         f(E) diagnostics, Tiers 1-2: per-(solve-iteration) summary of the in-loop
         energy term. Reports how often the predictor fit vs fell back to the
         nearest-neighbour default, how aggressively the cliff-break truncated and
@@ -2068,42 +2131,44 @@ class MATERIAL:
         in units of disp_scale), and how much weight the energy term carried in the
         blended score relative to the dot product. Together these say WHETHER f(E)
         influenced the clustering and whether its predictions were any good.
-        '''
-        if not _FE_DEBUG or stats['calls'] == 0:
+        """
+        if not _FE_DEBUG or stats["calls"] == 0:
             return
-        calls = stats['calls']
-        kept_mean = stats['kept_len_sum'] / calls if calls else 0.0
-        pair_n = stats['pair_n']
-        conn = stats['conn_sum'] / pair_n if pair_n else 0.0
-        eng = stats['eng_sum'] / pair_n if pair_n else 0.0
+        calls = stats["calls"]
+        kept_mean = stats["kept_len_sum"] / calls if calls else 0.0
+        pair_n = stats["pair_n"]
+        conn = stats["conn_sum"] / pair_n if pair_n else 0.0
+        eng = stats["eng_sum"] / pair_n if pair_n else 0.0
         total_w = conn + eng
         eng_frac = (eng / total_w) if total_w else 0.0
-        rn = stats['resid_n']
-        rb = stats['resid_buckets']
+        rn = stats["resid_n"]
+        rb = stats["resid_buckets"]
         rb_pct = [100.0 * b / rn for b in rb] if rn else [0.0] * len(rb)
         self.logger.info(
-            f'{BODY_INDENT}f(E) iter: calls={calls} fit={stats["fit"]} '
-            f'fallback={stats["fallback"]} ({100.0*stats["fallback"]/calls:.0f}%) '
-            f'clip_hit={stats["clip_hit"]} trunc={stats["trunc"]} kept_len={kept_mean:.2f}')
+            f"{BODY_INDENT}f(E) iter: calls={calls} fit={stats['fit']} "
+            f"fallback={stats['fallback']} ({100.0 * stats['fallback'] / calls:.0f}%) "
+            f"clip_hit={stats['clip_hit']} trunc={stats['trunc']} kept_len={kept_mean:.2f}"
+        )
         self.logger.info(
-            f'{BODY_INDENT}f(E) breaks: Ejump={stats["brk_ejump"]} bandchg={stats["brk_band"]} | '
-            f'term weight conn={conn:.3f} eng={eng:.3f} (eng/total={eng_frac:.2f})')
+            f"{BODY_INDENT}f(E) breaks: Ejump={stats['brk_ejump']} bandchg={stats['brk_band']} | "
+            f"term weight conn={conn:.3f} eng={eng:.3f} (eng/total={eng_frac:.2f})"
+        )
         self.logger.info(
-            f'{BODY_INDENT}f(E) resid/disp [<0.5,<1,<2,<5,>=5] %: '
-            f'[{", ".join(f"{p:.0f}" for p in rb_pct)}]  (n={rn})')
+            f"{BODY_INDENT}f(E) resid/disp [<0.5,<1,<2,<5,>=5] %: [{', '.join(f'{p:.0f}' for p in rb_pct)}]  (n={rn})"
+        )
 
     def _log_fE_outcome(self) -> None:
-        '''
+        """
         f(E) diagnostics, Tier 4: the energy-continuity validation outcome of the
         k-points attached during the last get_components call (the joins the
         sample-to-cluster score, and therefore f(E), helped decide) compared to the
         whole grid. If the attached points are disproportionately NOT/MIS, the
         attachment scoring is making bad joins in exactly the region it acted on.
-        '''
+        """
         if not _FE_DEBUG:
             return
-        attached = getattr(self, 'fE_attached_k', None)
-        val = getattr(self, 'correct_signalfinal', None)
+        attached = getattr(self, "fE_attached_k", None)
+        val = getattr(self, "correct_signalfinal", None)
         if attached is None or val is None or len(attached) == 0:
             return
 
@@ -2114,11 +2179,12 @@ class MATERIAL:
 
         all_rows = np.arange(val.shape[0])
         self.logger.info(
-            f'{BODY_INDENT}f(E) attached this iter: {len(attached)} k-point(s) | '
-            f'NOT/MIS over them: {bad_frac(attached):.1f}%  vs grid {bad_frac(all_rows):.1f}%')
+            f"{BODY_INDENT}f(E) attached this iter: {len(attached)} k-point(s) | "
+            f"NOT/MIS over them: {bad_frac(attached):.1f}%  vs grid {bad_frac(all_rows):.1f}%"
+        )
 
     def _partition_fused_component(self, sub_graph: nx.Graph) -> Union[list, None]:
-        '''
+        """
         Seeded region-growing split of an oversized (fused) graph component.
         Returns a list of node-sets, or None when it cannot run (no growth
         target reaches a usable seed; caller falls back to Louvain). A
@@ -2154,7 +2220,7 @@ class MATERIAL:
         genuine crossings). Deferred + unclaimed nodes are returned grouped as
         their connected pieces, so they enter the normal sample machinery and
         cannot shatter into singletons (and _ensure_connectivity still guards).
-        '''
+        """
         nks = self.nks
         comp_nodes = set(int(n) for n in sub_graph.nodes)
 
@@ -2169,9 +2235,9 @@ class MATERIAL:
             return None
 
         # One group per state node
-        group_of = {n: n for n in comp_nodes}           # state node -> group key
-        members = {n: [n] for n in comp_nodes}          # group key -> [state nodes]
-        gks = {n: {n % nks} for n in comp_nodes}        # group key -> {k-points}
+        group_of = {n: n for n in comp_nodes}  # state node -> group key
+        members = {n: [n] for n in comp_nodes}  # group key -> [state nodes]
+        gks = {n: {n % nks} for n in comp_nodes}  # group key -> {k-points}
 
         ###########################################################################
         # 2. Seeds: largest k-connected sovereign region per target band
@@ -2187,20 +2253,22 @@ class MATERIAL:
             if b in ks_of_band:
                 ks_of_band[b].add(n % nks)
 
-        regions: dict = {}                              # band -> largest sovereign region (k set)
+        regions: dict = {}  # band -> largest sovereign region (k set)
         for b in targets:
             band_ks = ks_of_band[b]
             sov = set()
             for k in band_ks:
                 if self.local_gap[k, b] <= 2.0 * self.band_disp[b]:
-                    continue                            # energy does not resolve this band here
-                dps = [float(self.connections[k, i, b, b])
-                       for i, kn in enumerate(neigh[k])
-                       if kn != -1 and int(kn) in band_ks]
+                    continue  # energy does not resolve this band here
+                dps = [
+                    float(self.connections[k, i, b, b])
+                    for i, kn in enumerate(neigh[k])
+                    if kn != -1 and int(kn) in band_ks
+                ]
                 if dps and min(dps) >= RG_SEED_DP:
                     sov.add(k)
             best = None
-            while sov:                                  # largest k-connected sovereign region
+            while sov:  # largest k-connected sovereign region
                 start = sov.pop()
                 region = {start}
                 queue = deque([start])
@@ -2217,7 +2285,7 @@ class MATERIAL:
             if best:
                 regions[b] = best
 
-        seeds: dict = {}                                # band -> [seed groups]
+        seeds: dict = {}  # band -> [seed groups]
         seeded_groups: set = set()
         for b, region in sorted(regions.items(), key=lambda t: -len(t[1])):
             gs: list = []
@@ -2237,9 +2305,9 @@ class MATERIAL:
         ###########################################################################
         # 3. Multi-source cheapest-frontier growth over groups.
         ###########################################################################
-        assigned: dict = {}                             # group -> label (a seed band id)
-        owns_k = {b: set() for b in seeds}              # label -> k-points it holds
-        offers: dict = {}                               # group -> {label: best offered cost}
+        assigned: dict = {}  # group -> label (a seed band id)
+        owns_k = {b: set() for b in seeds}  # label -> k-points it holds
+        offers: dict = {}  # group -> {label: best offered cost}
         deferred: set = set()
         heap: list = []
 
@@ -2254,10 +2322,10 @@ class MATERIAL:
                         continue
                     kw, bw = w % nks, w // nks
                     if kw in owns_k[label]:
-                        continue                        # cheap pre-filter; full group check at claim
+                        continue  # cheap pre-filter; full group check at claim
                     if abs(float(self.eigenvalues[kw, bw]) - Ev) > self._local_accept(kw, bw):
-                        continue                        # across a local energy wall
-                    cost = max(0.0, 1.0 - float(sub_graph[v][w].get('weight', 0.0)))
+                        continue  # across a local energy wall
+                    cost = max(0.0, 1.0 - float(sub_graph[v][w].get("weight", 0.0)))
                     node_offers = offers.setdefault(gw, {})
                     if cost < node_offers.get(label, np.inf):
                         node_offers[label] = cost
@@ -2276,12 +2344,13 @@ class MATERIAL:
             if g in assigned or g in deferred:
                 continue
             if gks[g] & owns_k[label]:
-                continue                                # k-collision materialized since the push
+                continue  # k-collision materialized since the push
             # Contested: another label still able to claim g (no k-collision)
             # offered a cost within the margin -- defer instead of guessing.
             rivals = offers.get(g, {})
-            if any(l2 != label and (c2 - cost) < RG_DEFER_MARGIN
-                   and not (gks[g] & owns_k[l2]) for l2, c2 in rivals.items()):
+            if any(
+                l2 != label and (c2 - cost) < RG_DEFER_MARGIN and not (gks[g] & owns_k[l2]) for l2, c2 in rivals.items()
+            ):
                 deferred.add(g)
                 continue
             assigned[g] = label
@@ -2304,17 +2373,19 @@ class MATERIAL:
                 parts.append(set(int(x) for x in piece))
                 n_pieces += 1
         grown = sorted(seeds)
-        self.logger.info(f'{BODY_INDENT}Region-growing: {len(comp_nodes)}-node component '
-                         f'({len(members)} group(s)), '
-                         f'{len(targets)} fused band(s) {targets} -> grown '
-                         f'{[len(label_nodes[b]) for b in grown]} node(s) for bands {grown} '
-                         f'(seeds {[sum(len(members[g]) for g in seeds[b]) for b in grown]}), '
-                         f'{len(deferred)} contested group(s) deferred, '
-                         f'{len(leftover)} leftover in {n_pieces} piece(s)')
+        self.logger.info(
+            f"{BODY_INDENT}Region-growing: {len(comp_nodes)}-node component "
+            f"({len(members)} group(s)), "
+            f"{len(targets)} fused band(s) {targets} -> grown "
+            f"{[len(label_nodes[b]) for b in grown]} node(s) for bands {grown} "
+            f"(seeds {[sum(len(members[g]) for g in seeds[b]) for b in grown]}), "
+            f"{len(deferred)} contested group(s) deferred, "
+            f"{len(leftover)} leftover in {n_pieces} piece(s)"
+        )
         return parts
 
-    def get_components(self, alpha: float=0.5, compute_communities=False) -> None:
-        '''
+    def get_components(self, alpha: float = 0.5, compute_communities=False) -> None:
+        """
         The make_connections function constructs the graph, in which
         it can detect components well constructed.
             - A component is denominated solved when it has all
@@ -2323,21 +2394,21 @@ class MATERIAL:
               with any other cluster.
             - Otherwise, It is a sample that has to be grouped with
               some cluster.
-        
+
         Parameters
             alpha : float
                 The weight of connection to consider for score calculation.
                     score = alpha*<i|j> + (1-alpha)*f(E_i)
-        '''
+        """
 
         ###########################################################################
         # Identify connected components inside the GRAPH
         ###########################################################################
-        self.logger.info('\n\n\t\tNumber of Components: '.rstrip('\n'))
-        self.logger.info(f'\t\t{nx.number_connected_components(self.GRAPH)}')
+        self.logger.info("\n\n\t\tNumber of Components: ".rstrip("\n"))
+        self.logger.info(f"\t\t{nx.number_connected_components(self.GRAPH)}")
 
         resolution = 1
-        step = 0.1 
+        step = 0.1
         flag_resolution = True
         max_iter = 5
         iteration = 0
@@ -2349,21 +2420,20 @@ class MATERIAL:
         N_g_nks_prev = self.nbnd
 
         def communites2clusters(communities) -> list[COMPONENT]:
-            self.components = [COMPONENT(c,
-                                        self.kpoints_index,
-                                        self.matrix,
-                                        self.dimensions)
-                            for c in communities]    # Identify the components
+            self.components = [
+                COMPONENT(c, self.kpoints_index, self.matrix, self.dimensions) for c in communities
+            ]  # Identify the components
 
-            index_sorted = np.argsort([component.N
-                                    for component in self.components])[::-1] # Sort the components by the number of nodes in decreasing order
+            index_sorted = np.argsort([component.N for component in self.components])[
+                ::-1
+            ]  # Sort the components by the number of nodes in decreasing order
 
             ###########################################################################
             # Identify the clusters and samples
             ###########################################################################
-            self.solved : list[COMPONENT] = []
-            clusters : list[COMPONENT] = []
-            samples : list[COMPONENT] = []
+            self.solved: list[COMPONENT] = []
+            clusters: list[COMPONENT] = []
+            samples: list[COMPONENT] = []
             number_nodes = []
             for i in index_sorted:
                 # The first biggest components that can not join to the others are identified as clusters
@@ -2373,30 +2443,29 @@ class MATERIAL:
                     #  If the number of nodes inside the component equals the total number of k points, the cluster is considered solved
                     self.solved.append(component)
                     continue
-                    
+
                 component.calculate_pointsMatrix()  # Computes the projection into k-space
-                component.calc_boundary()           # Undersample the points by representative points identification
+                component.calc_boundary()  # Undersample the points by representative points identification
                 if len(clusters) == 0:
                     # The biggest component if it is not complete then it is the first cluster
                     clusters.append(component)
                     continue
-                if not np.any([cluster.validate(component)
-                            for cluster in clusters]):
+                if not np.any([cluster.validate(component) for cluster in clusters]):
                     # Verification if the component can join other clusters.
                     # If it can not, then it is a cluster.
                     clusters.append(component)
                 else:
                     # If it can, then it is a sample.
                     samples.append(component)
-            
-            self.logger.info(f'\t\tNumber of Communities: {len(self.components)}')
-            self.logger.info(f'\t\tPhase 1: {len(self.solved)}/{self.nbnd} Solved')
-            self.logger.info(f'\t\tInitial clusters: {len(clusters)} Samples: {len(samples)}')
+
+            self.logger.info(f"\t\tNumber of Communities: {len(self.components)}")
+            self.logger.info(f"\t\tPhase 1: {len(self.solved)}/{self.nbnd} Solved")
+            self.logger.info(f"\t\tInitial clusters: {len(clusters)} Samples: {len(samples)}")
 
             number_nodes = np.array(number_nodes)
             N_g_nks = np.sum(number_nodes > self.nks)
 
-            self.logger.info(f'\t\tNumber of components with more than {self.nks} nodes: {N_g_nks}')
+            self.logger.info(f"\t\tNumber of components with more than {self.nks} nodes: {N_g_nks}")
 
             return clusters, samples, N_g_nks
 
@@ -2411,7 +2480,7 @@ class MATERIAL:
             # region-growing finds no usable seeds.
             ###########################################################################
             if compute_communities:
-                self.logger.info(f'\n\t\tResolution: {resolution:.2f}, Iteration: {iteration + 1}')
+                self.logger.info(f"\n\t\tResolution: {resolution:.2f}, Iteration: {iteration + 1}")
 
             used_fallback = False
             sub_graphs = []
@@ -2422,13 +2491,14 @@ class MATERIAL:
                     continue
                 parts = self._partition_fused_component(sub_graph)
                 if parts is None:
-                    self.logger.info(f'{BODY_INDENT}Region-growing: no usable seeds in a '
-                                     f'{sub_graph.number_of_nodes()}-node component -- Louvain fallback')
-                    parts = nx.community.louvain_communities(sub_graph, resolution=resolution, weight='weight')
+                    self.logger.info(
+                        f"{BODY_INDENT}Region-growing: no usable seeds in a "
+                        f"{sub_graph.number_of_nodes()}-node component -- Louvain fallback"
+                    )
+                    parts = nx.community.louvain_communities(sub_graph, resolution=resolution, weight="weight")
                     used_fallback = True
                 for new_c in parts:
                     sub_graphs.append(sub_graph.subgraph(new_c))
-
 
             clusters, samples, N_g_nks = communites2clusters(sub_graphs)
 
@@ -2444,29 +2514,35 @@ class MATERIAL:
             if total_bands_computed == self.nbnd and N_g_nks == 0:
                 break
 
-            if len(clusters) * len(samples) and (best_iteration is None or np.abs(self.nbnd - total_bands_computed) < best_score and len(self.solved) > max_solved and N_g_nks < N_g_nks_prev):
+            if len(clusters) * len(samples) and (
+                best_iteration is None
+                or np.abs(self.nbnd - total_bands_computed) < best_score
+                and len(self.solved) > max_solved
+                and N_g_nks < N_g_nks_prev
+            ):
                 best_iteration = sub_graphs
                 best_score = np.abs(self.nbnd - total_bands_computed)
                 max_solved = len(self.solved)
-            N_g_nks_prev = N_g_nks                  # track progress for the acceptance test above
+            N_g_nks_prev = N_g_nks  # track progress for the acceptance test above
 
             iteration += 1
             if iteration == max_iter:
                 if best_iteration is not None:
                     sub_graphs = best_iteration
-                    self.logger.info(f'\n\t\tBest Iteration:')
+                    self.logger.info("\n\t\tBest Iteration:")
                     clusters, samples, N_g_nks = communites2clusters(sub_graphs)
                 else:
                     # No sweep iteration ever qualified as "best": keep the
                     # current split instead of crashing on a None graph list.
-                    self.logger.info(f'\n\t\tResolution sweep exhausted with no best '
-                                     f'iteration recorded -- keeping the last split')
+                    self.logger.info(
+                        "\n\t\tResolution sweep exhausted with no best iteration recorded -- keeping the last split"
+                    )
                 break
 
             if total_bands_computed > self.nbnd:
-                resolution  -= step
+                resolution -= step
             else:
-                resolution  += step
+                resolution += step
             step /= 2
 
         ###########################################################################
@@ -2476,64 +2552,69 @@ class MATERIAL:
             if _FE_DEBUG:
                 # Per-chunk reset; the chunk's delta is returned below and summed in
                 # the parent (forked workers each carry their own copy).
-                _FE_STATS.clear(); _FE_STATS.update(_fe_stats_new())
+                _FE_STATS.clear()
+                _FE_STATS.update(_fe_stats_new())
             result = []
             for i_s in iterator:
                 sample = samples[i_s]
                 # Comparison of each sample to each cluster
-                scores = np.zeros(len(clusters))                                    # Storage the score of each cluster with the sample
+                scores = np.zeros(len(clusters))  # Storage the score of each cluster with the sample
                 for j_s, cluster in enumerate(clusters):
                     if not cluster.validate(sample):
                         # If this sample can not join the cluster, the score is 0
                         continue
-                    scores[j_s] = sample.get_cluster_score(cluster,
-                                                           self.neighbors,
-                                                           self.ENERGIES,
-                                                           self.connections,
-                                                           alpha=alpha,
-                                                           accept_E=self.accept_E,
-                                                           disp_scale=self.disp_scale,
-                                                           fe_eweight=self.fe_eweight,
-                                                           tol=self.tol)  # Calculate the score (new f(E))
+                    scores[j_s] = sample.get_cluster_score(
+                        cluster,
+                        self.neighbors,
+                        self.ENERGIES,
+                        self.connections,
+                        alpha=alpha,
+                        accept_E=self.accept_E,
+                        disp_scale=self.disp_scale,
+                        fe_eweight=self.fe_eweight,
+                        tol=self.tol,
+                    )  # Calculate the score (new f(E))
                 result.append([i_s, [np.max(scores), np.argmax(scores)], sample.scores])
 
             if _FE_DEBUG:
-                result.append(['__FE_STATS__', dict(_FE_STATS), None])           # chunk's f(E) counts
+                result.append(["__FE_STATS__", dict(_FE_STATS), None])  # chunk's f(E) counts
             return result
 
         count = np.array([0, len(samples) * len(samples)])
-        fe_agg = _fe_stats_new()                                                 # f(E) diagnostics for this get_components call
-        fe_attached_k = set()                                                    # k-points joined this call (Tier 4)
+        fe_agg = _fe_stats_new()  # f(E) diagnostics for this get_components call
+        fe_attached_k = set()  # k-points joined this call (Tier 4)
         while len(samples) > 0:
-            evaluate_samples = np.zeros((len(samples), 2))                          # Samples' scores storage
-            self.logger.debug(f'Len samples: {len(samples)}')
-            self.logger.debug(f'Len clusters: {len(clusters)}')
+            evaluate_samples = np.zeros((len(samples), 2))  # Samples' scores storage
+            self.logger.debug(f"Len samples: {len(samples)}")
+            self.logger.debug(f"Len clusters: {len(clusters)}")
             if len(clusters) == 0 and len(samples) > 0:
-                self.logger.debug('No more clusters')
-                self.logger.debug(f'Len samples: {len(samples)}')
-                self.logger.debug(f'Size samples: {samples[0].N}')
-                self.logger.debug(f'Number solved: {len(self.solved)}')
+                self.logger.debug("No more clusters")
+                self.logger.debug(f"Len samples: {len(samples)}")
+                self.logger.debug(f"Size samples: {samples[0].N}")
+                self.logger.debug(f"Number solved: {len(self.solved)}")
                 break
 
-            evaluate_samples_result = self.parallelize('\t\tClustering Samples', evaluate_sample, range(len(samples)), per_actual=count[0], N_total=count[1])
+            evaluate_samples_result = self.parallelize(
+                "\t\tClustering Samples", evaluate_sample, range(len(samples)), per_actual=count[0], N_total=count[1]
+            )
             count[0] += len(samples)
             for i_s, res, sample_scores in evaluate_samples_result:
-                if i_s == '__FE_STATS__':
-                    _fe_stats_merge(fe_agg, res)                      # res = this chunk's f(E) counts
+                if i_s == "__FE_STATS__":
+                    _fe_stats_merge(fe_agg, res)  # res = this chunk's f(E) counts
                     continue
                 samples[i_s].scores = sample_scores
-                evaluate_samples[i_s] = np.array(res)                 # Store the best cluster's score
+                evaluate_samples[i_s] = np.array(res)  # Store the best cluster's score
 
             for cluster in clusters:
                 # Flag used to identify if the score must be calculated again
                 cluster.was_modified = False
-                
+
             bn_list = []
             args_list = []
             clusters_completed = []
-            args_sort = np.argsort(evaluate_samples[:, 0])[::-1]                       # Sort the samples by the score
+            args_sort = np.argsort(evaluate_samples[:, 0])[::-1]  # Sort the samples by the score
             for arg_max in args_sort:
-                score, bn = evaluate_samples[arg_max]                                   # Get the values
+                score, bn = evaluate_samples[arg_max]  # Get the values
                 bn = int(bn)
                 if score <= 0:
                     # No admissible cluster for this sample (every validate() failed,
@@ -2546,20 +2627,20 @@ class MATERIAL:
                     break
                 args_list.append(arg_max)
                 bn_list.append(bn)
-                sample = samples[arg_max]                                               # Get the sample
-                count[0] += 1                                                           # Update the counter
-                clusters[bn].join(sample)                                               # Join the sample to the best cluster
+                sample = samples[arg_max]  # Get the sample
+                count[0] += 1  # Update the counter
+                clusters[bn].join(sample)  # Join the sample to the best cluster
                 clusters[bn].was_modified = True
                 if _FE_DEBUG:
                     fe_attached_k.update((np.array(sample.GRAPH.nodes) % self.nks).tolist())  # Tier 4
-    
-                self.logger.percent_complete(count[0], count[1], title='\tClustering Samples')
-                self.logger.debug(f'\t\t{count[0]}/{count[1]} Sample corrected: {score}')
+
+                self.logger.percent_complete(count[0], count[1], title="\tClustering Samples")
+                self.logger.debug(f"\t\t{count[0]}/{count[1]} Sample corrected: {score}")
                 if clusters[bn].N == self.nks:
                     #  If the number of nodes inside the component equals the total number of k points, the cluster is considered solved
                     clusters_completed.append(bn)
-                    self.logger.debug('\n\tCluster Solved')
-                    
+                    self.logger.debug("\n\tCluster Solved")
+
             # Eliminate the samples that were joined to a cluster
             samples = [samples[arg] for arg in args_sort if arg not in args_list]
 
@@ -2568,8 +2649,7 @@ class MATERIAL:
                 # for every cluster, so another round cannot change anything (the
                 # loop would spin forever). Their nodes stay unattributed and flow
                 # into the repair / completeness passes.
-                self.logger.info(f'\t\t{len(samples)} unattachable sample(s) left '
-                                 f'unclustered (no admissible cluster)')
+                self.logger.info(f"\t\t{len(samples)} unattachable sample(s) left unclustered (no admissible cluster)")
                 break
 
             new_clusters = []
@@ -2582,21 +2662,21 @@ class MATERIAL:
 
             clusters = new_clusters
 
-        self.logger.percent_complete(count[1], count[1], title='\tClustering Samples')
-        self.fE_attached_k = np.array(sorted(fe_attached_k), dtype=int)          # for the Tier-4 outcome log
-        self._log_fE_stats(fe_agg)                                               # Tier 1 + 2 per-iteration block
-        self.logger.info(f'\t\tPhase 2: {len(self.solved)}/{self.nbnd} Solved')
+        self.logger.percent_complete(count[1], count[1], title="\tClustering Samples")
+        self.fE_attached_k = np.array(sorted(fe_attached_k), dtype=int)  # for the Tier-4 outcome log
+        self._log_fE_stats(fe_agg)  # Tier 1 + 2 per-iteration block
+        self.logger.info(f"\t\tPhase 2: {len(self.solved)}/{self.nbnd} Solved")
 
-        if len(self.solved)/self.nbnd < 1:
-            self.logger.info(f'\t\tNew clusters: {len(clusters)}')
+        if len(self.solved) / self.nbnd < 1:
+            self.logger.info(f"\t\tNew clusters: {len(clusters)}")
 
-        self.clusters : list[COMPONENT] = clusters
+        self.clusters: list[COMPONENT] = clusters
 
     def obtain_output(self) -> None:
-        '''
+        """
         This function prepares the final data structures
         that are essential to other programs.
-        '''
+        """
 
         ###########################################################################
         # Conflict-aware slot assignment (option 3: 0.6*dot-product + 0.4*energy).
@@ -2638,7 +2718,7 @@ class MATERIAL:
                     n += 1
             return total / n if n else 0.0
 
-        def _energy_fit(comp, bn: int) -> Tuple[bool, float]:
+        def _energy_fit(comp, bn: int) -> tuple[bool, float]:
             # Agreement of the component's energy trajectory with band-slot bn's
             # energy line. Returns (admissible, score); ``admissible`` is the hard
             # energy-difference gate: mean |E_C - E(.,bn)| <= accept_E.
@@ -2659,7 +2739,7 @@ class MATERIAL:
         def _candidates(comp) -> list:
             # Ranked (band, fitness) preference list over the component's own raw
             # bands, energy-admissible only, best first.
-            comp.get_bands()                                                        # sets comp.bands / bands_number / k_points
+            comp.get_bands()  # sets comp.bands / bands_number / k_points
             dp = _dp_coherence(comp)
             prefs = []
             for bn in comp.bands:
@@ -2674,42 +2754,47 @@ class MATERIAL:
             # Deferred-acceptance assignment with eviction. ``forbidden`` is the set
             # of columns already owned by an earlier phase (immovable here).
             prefs = [_candidates(c) for c in components]
-            owner = {}                                                              # column -> component index holding it
-            owner_fit = {}                                                          # column -> that holder's fitness
-            placed = {}                                                             # component index -> column
+            owner = {}  # column -> component index holding it
+            owner_fit = {}  # column -> that holder's fitness
+            placed = {}  # component index -> column
             rank = [0] * len(components)
             queue = deque(range(len(components)))
             guard = 0
             guard_max = (len(components) + 1) * (self.total_bands + 2) + 16
             while queue:
                 guard += 1
-                if guard > guard_max:                                               # belt-and-suspenders: cannot loop forever
-                    self.logger.warning(f'{BODY_INDENT}conflict solver guard hit; '
-                                        f'{len(queue)} component(s) left unattributed')
+                if guard > guard_max:  # belt-and-suspenders: cannot loop forever
+                    self.logger.warning(
+                        f"{BODY_INDENT}conflict solver guard hit; {len(queue)} component(s) left unattributed"
+                    )
                     break
                 ci = queue.popleft()
                 pl = prefs[ci]
                 r = rank[ci]
                 while r < len(pl):
                     bn, fit = pl[r]
-                    if bn in forbidden:                                             # owned by an earlier phase
+                    if bn in forbidden:  # owned by an earlier phase
                         r += 1
                         continue
-                    if bn not in owner:                                             # free column: take it
-                        owner[bn] = ci; owner_fit[bn] = fit
-                        placed[ci] = bn; rank[ci] = r
+                    if bn not in owner:  # free column: take it
+                        owner[bn] = ci
+                        owner_fit[bn] = fit
+                        placed[ci] = bn
+                        rank[ci] = r
                         break
-                    if fit > owner_fit[bn]:                                         # better suited: evict the holder
+                    if fit > owner_fit[bn]:  # better suited: evict the holder
                         cj = owner[bn]
                         placed.pop(cj, None)
-                        owner[bn] = ci; owner_fit[bn] = fit
-                        placed[ci] = bn; rank[ci] = r
-                        rank[cj] += 1                                               # loser resumes past the lost band
-                        queue.append(cj)                                           # re-apply the conflict solver to it
+                        owner[bn] = ci
+                        owner_fit[bn] = fit
+                        placed[ci] = bn
+                        rank[ci] = r
+                        rank[cj] += 1  # loser resumes past the lost band
+                        queue.append(cj)  # re-apply the conflict solver to it
                         break
-                    r += 1                                                          # lose this column, try our next band
+                    r += 1  # lose this column, try our next band
                 else:
-                    rank[ci] = len(pl)                                              # exhausted: unattributed this iteration
+                    rank[ci] = len(pl)  # exhausted: unattributed this iteration
             return placed
 
         # Phase 1: full-grid solved components compete among themselves.
@@ -2722,36 +2807,36 @@ class MATERIAL:
         ###########################################################################
         for ci, solved in enumerate(self.solved):
             bn = solved_slot.get(ci)
-            if bn is None:                                                          # unattributed this iteration
+            if bn is None:  # unattributed this iteration
                 continue
-            bands = solved.get_bands()                                              # Getting the k-points' raw bands inside the solved cluster
-            self.bands_final[solved.k_points, bn] = bands                           # Update the resultant bands' attribution array
+            bands = solved.get_bands()  # Getting the k-points' raw bands inside the solved cluster
+            self.bands_final[solved.k_points, bn] = bands  # Update the resultant bands' attribution array
 
             for k in solved.k_points:
                 # For each k-point is calculate the solution score
-                bn1 = solved.bands_number[k]                                        # The k-point's band
-                connections = []                                                    # The array that store the dot-product with the k-point's neighbors
+                bn1 = solved.bands_number[k]  # The k-point's band
+                connections = []  # The array that store the dot-product with the k-point's neighbors
                 for i_neig, k_neig in enumerate(self.neighbors[k]):
                     # Obtain the dot-product with each neighbor
                     if k_neig == -1 or k_neig not in solved.k_points:
                         continue
                     if solved.bands_number.get(k_neig) is None:
                         solved.calculate_values()
-                    bn2 = solved.bands_number[k_neig]                               # The neighbor's band
-                    connections.append(self.connections[k, i_neig, bn1, bn2])       # <k, k neighbor>
+                    bn2 = solved.bands_number[k_neig]  # The neighbor's band
+                    connections.append(self.connections[k, i_neig, bn1, bn2])  # <k, k neighbor>
 
-                self.signal_final[k, bn] = evaluate_result(connections)             # Computes the k-point's signal
+                self.signal_final[k, bn] = evaluate_result(connections)  # Computes the k-point's signal
 
         for ci, cluster in enumerate(self.clusters):
             bn = cluster_slot.get(ci)
-            if bn is None:                                                          # unattributed this iteration
+            if bn is None:  # unattributed this iteration
                 continue
-            bands = cluster.get_bands()                                             # Getting the k-points' raw bands inside the cluster
-            self.bands_final[cluster.k_points, bn] = bands                          # Update the resultant bands' attribution array
+            bands = cluster.get_bands()  # Getting the k-points' raw bands inside the cluster
+            self.bands_final[cluster.k_points, bn] = bands  # Update the resultant bands' attribution array
             for k in cluster.k_points:
                 # For each k-point is calculate the solution score
-                bn1 = cluster.bands_number[k]                                       # The k-point's band
-                connections = []                                                    # The array that store the dot-product with the k-point's neighbors
+                bn1 = cluster.bands_number[k]  # The k-point's band
+                connections = []  # The array that store the dot-product with the k-point's neighbors
                 for i_neig, k_neig in enumerate(self.neighbors[k]):
                     # Obtain the dot-product with each neighbor
                     if k_neig == -1:
@@ -2760,53 +2845,50 @@ class MATERIAL:
                         # If the neighbor does not exist inside the cluster, the dot-product is 0
                         connections.append(0)
                         continue
-                    bn2 = cluster.bands_number[k_neig]                              # The neighbor's band
-                    connections.append(self.connections[k, i_neig, bn1, bn2])       # <k, k neighbor>
+                    bn2 = cluster.bands_number[k_neig]  # The neighbor's band
+                    connections.append(self.connections[k, i_neig, bn1, bn2])  # <k, k neighbor>
 
-                self.signal_final[k, bn] = evaluate_result(connections)             # Computes the k-point's signal
-
+                self.signal_final[k, bn] = evaluate_result(connections)  # Computes the k-point's signal
 
         ###########################################################################
         # Scoring the result.
         # Signaling and storage of degenerate k-points.
         ###########################################################################
-        self.degenerate_final = []                                                 # Final degenerates k-points
+        self.degenerate_final = []  # Final degenerates k-points
         for d1, d2 in self.degenerates:
             # Signaling the numerically degenerate points Ei ~ Ej
-            k1 = d1 % self.nks                                              # k point
-            bn1 = d1 // self.nks                                            # band
-            k2 = d2 % self.nks                                              # k point
-            bn2 = d2 // self.nks                                            # band
-            Bk1 = self.bands_final[k1] == bn1                               # Find in which  band the k-point was attributed
-            Bk2 = self.bands_final[k2] == bn2                               # Find in which  band the k-point was attributed
-            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1               # Final band
-            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2               # Final band
+            k1 = d1 % self.nks  # k point
+            bn1 = d1 // self.nks  # band
+            k2 = d2 % self.nks  # k point
+            bn2 = d2 // self.nks  # band
+            Bk1 = self.bands_final[k1] == bn1  # Find in which  band the k-point was attributed
+            Bk2 = self.bands_final[k2] == bn2  # Find in which  band the k-point was attributed
+            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1  # Final band
+            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2  # Final band
 
-            self.signal_final[k1, bn1] = DEGENERATE                         # Signal k_point as Degenerate
-            self.signal_final[k2, bn2] = DEGENERATE                         # Signal k_point as Degenerate
+            self.signal_final[k1, bn1] = DEGENERATE  # Signal k_point as Degenerate
+            self.signal_final[k2, bn2] = DEGENERATE  # Signal k_point as Degenerate
 
-            k_neigs = self.neighbors[k1]                                    # k-point's neighbors
-            flag_neig = k_neigs != -1                                       # Flag to obtain the allowed neighbors
-            i_neigs = np.arange(self.number_neighbors)[flag_neig]                         # Neighbors' index
-            k_neigs = k_neigs[flag_neig]                                    # Allowed neighbors
+            k_neigs = self.neighbors[k1]  # k-point's neighbors
+            flag_neig = k_neigs != -1  # Flag to obtain the allowed neighbors
+            i_neigs = np.arange(self.number_neighbors)[flag_neig]  # Neighbors' index
+            k_neigs = k_neigs[flag_neig]  # Allowed neighbors
 
             if len(k_neigs) == 0:
                 # If there are no neighbors the k-point's score is 0
                 continue
-            bn1 = self.bands_final[k1, bn1]                                 # K-point's band
-            bn2 = self.bands_final[k2, bn2]                                 # K-point's band
+            bn1 = self.bands_final[k1, bn1]  # K-point's band
+            bn2 = self.bands_final[k2, bn2]  # K-point's band
             if bn1 < 0 or bn2 < 0:
                 # Unattributed slot: no dp evidence to test (connections[..., -1, ...]
                 # would silently read the LAST band) and a [k, -1, b] row must never
                 # reach degeneratefinal.npy. The DEGENERATE signal above stands.
                 continue
-            dps = self.connections[k1, i_neigs, bn1, bn2]        # Dot-product between the k-point and their neighbors
+            dps = self.connections[k1, i_neigs, bn1, bn2]  # Dot-product between the k-point and their neighbors
             if np.any(np.logical_and(dps >= 0.5, dps <= 0.8)):
-                # It is considered degenerate if the k-point has some 
+                # It is considered degenerate if the k-point has some
                 # neighbor's dot-product between 0.5 and 0.8
-                self.degenerate_final.append([k1, bn1, bn2])                # Storage the degenerate k-point
-
-
+                self.degenerate_final.append([k1, bn1, bn2])  # Storage the degenerate k-point
 
         for bn in range(self.total_bands):
             # Calculating the score of the result
@@ -2816,29 +2898,33 @@ class MATERIAL:
                 if self.signal_final[k, bn] == NOT_SOLVED:
                     # If this k-point had not been solved the analysis can not be done
                     continue
-                kneigs = self.neighbors[k]                                                  # k-point's neighbors
-                flag_neig = kneigs != -1                                                    # Flag to obtain the allowed neighbors 
-                i_neigs = np.arange(self.number_neighbors)[flag_neig]                                     # Neighbors' index
-                kneigs = kneigs[flag_neig]                                                  # Allowed neighbors
-                flag_neig = self.signal_final[kneigs, bn] != NOT_SOLVED                     # Flag to obtain only attributed neighbors
-                i_neigs = i_neigs[flag_neig]                                                # Update Neighbors' index
-                kneigs = kneigs[flag_neig]                                                  # Update neighbors
+                kneigs = self.neighbors[k]  # k-point's neighbors
+                flag_neig = kneigs != -1  # Flag to obtain the allowed neighbors
+                i_neigs = np.arange(self.number_neighbors)[flag_neig]  # Neighbors' index
+                kneigs = kneigs[flag_neig]  # Allowed neighbors
+                flag_neig = self.signal_final[kneigs, bn] != NOT_SOLVED  # Flag to obtain only attributed neighbors
+                i_neigs = i_neigs[flag_neig]  # Update Neighbors' index
+                kneigs = kneigs[flag_neig]  # Update neighbors
                 if len(kneigs) == 0:
                     # If there are no neighbors the k-point's score is 0
                     continue
-                bn_k = self.bands_final[k, bn]                                              # K-point's band
-                bn_neighs = self.bands_final[kneigs, bn]                                    # Neighbors' bands
-                k = np.repeat(k, len(kneigs))                                               # Array with the same k-point
-                bn_k = np.repeat(bn_k, len(kneigs))                                         # Array with the same K-point's band
-                dps = self.connections[k, i_neigs, bn_k, bn_neighs]                         # The array with the dot-product between the k-point and their neighbors
-                score += np.mean(dps)                                                       # Update the band score
-            score /= self.nks                                                               # Compute the mean socore
-            self.final_score[bn] = score                                                    # Storage the band score
+                bn_k = self.bands_final[k, bn]  # K-point's band
+                bn_neighs = self.bands_final[kneigs, bn]  # Neighbors' bands
+                k = np.repeat(k, len(kneigs))  # Array with the same k-point
+                bn_k = np.repeat(bn_k, len(kneigs))  # Array with the same K-point's band
+                dps = self.connections[
+                    k, i_neigs, bn_k, bn_neighs
+                ]  # The array with the dot-product between the k-point and their neighbors
+                score += np.mean(dps)  # Update the band score
+            score /= self.nks  # Compute the mean socore
+            self.final_score[bn] = score  # Storage the band score
 
         self.degenerate_final = np.array(self.degenerate_final)
-    
-    def print_report(self, signal_report: np.ndarray, description:str, show:bool=True, header_text:list=None) -> (str, np.ndarray):
-        '''
+
+    def print_report(
+        self, signal_report: np.ndarray, description: str, show: bool = True, header_text: list = None
+    ) -> (str, np.ndarray):
+        """
         Shows on screen the report for each band.
 
         Parameters
@@ -2850,8 +2936,8 @@ class MATERIAL:
                 If it is true then the table is shown. Otherwise, the string and the report are returned.
         Return
             final_report : string
-        '''
-        final_report = f'\n{TITLE_INDENT}====== {description} ======\n'
+        """
+        final_report = f"\n{TITLE_INDENT}====== {description} ======\n"
         bands_report = []
         # The set of signal codes (and therefore the column layout) depends on
         # which array is being reported, so the caller passes the matching header.
@@ -2862,50 +2948,50 @@ class MATERIAL:
         # Prepare the summary for each band
         ###########################################################################
         for bn in range(self.nbnd):
-            band_result = signal_report[:, bn]                              # Obtain all k-point' signals for band bn
-            report = [np.sum(band_result == s) for s in range(n_codes)]     # Set the band report
-            report.append(np.round(self.final_score[bn], 4))                # Set the final score
+            band_result = signal_report[:, bn]  # Obtain all k-point' signals for band bn
+            report = [np.sum(band_result == s) for s in range(n_codes)]  # Set the band report
+            report.append(np.round(self.final_score[bn], 4))  # Set the final score
             bands_report.append(report)
 
-            self.logger.debug(f'\t\t\tNew Band: {bn}\tnr fails: {report[0]}')
-            if report[0] and self.logger.level <= logging.DEBUG:        # list the failing k-points (were only counted)
+            self.logger.debug(f"\t\t\tNew Band: {bn}\tnr fails: {report[0]}")
+            if report[0] and self.logger.level <= logging.DEBUG:  # list the failing k-points (were only counted)
                 not_ks = np.where(band_result == NOT_SOLVED)[0]
-                self.logger.debug(f'\t\t\t  band {bn} NOT at {len(not_ks)} k-point(s): {not_ks.tolist()}')
+                self.logger.debug(f"\t\t\t  band {bn} NOT at {len(not_ks)} k-point(s): {not_ks.tolist()}")
 
         ###########################################################################
         # Set up the data representation
         ###########################################################################
         bands_report = np.array(bands_report)
 
-        header = list(header_text) + ['Score']
+        header = list(header_text) + ["Score"]
         n_spaces = len(str(np.max(bands_report[:, -1]))) + 4
 
         # Visible (indent-free) header line, so the underline matches its width.
-        header_line = ' Band | ' + ''.join(f"{h:^{n_spaces}}" for h in header[:-1])
-        header_line += f'{header[-1]:>8}'
+        header_line = " Band | " + "".join(f"{h:^{n_spaces}}" for h in header[:-1])
+        header_line += f"{header[-1]:>8}"
 
-        final_report += f'\n{BODY_INDENT} Signaling: how many events in each band signaled.\n'
-        final_report += _format_legend(header)                          # meaning of every column
-        final_report += f'\n{BODY_INDENT}{header_line}'
-        final_report += f'\n{BODY_INDENT}' + '-' * len(header_line)
+        final_report += f"\n{BODY_INDENT} Signaling: how many events in each band signaled.\n"
+        final_report += _format_legend(header)  # meaning of every column
+        final_report += f"\n{BODY_INDENT}{header_line}"
+        final_report += f"\n{BODY_INDENT}" + "-" * len(header_line)
 
         for bn, report in enumerate(bands_report):
-            row = f' {bn+self.min_band:<4d} | '
-            row += ''.join(f"{int(r):^{n_spaces}d}" for r in report[:-1])
-            row += f'{report[-1]:>8.4f}'
-            final_report += f'\n{BODY_INDENT}{row}'
-        final_report += '\n'
+            row = f" {bn + self.min_band:<4d} | "
+            row += "".join(f"{int(r):^{n_spaces}d}" for r in report[:-1])
+            row += f"{report[-1]:>8.4f}"
+            final_report += f"\n{BODY_INDENT}{row}"
+        final_report += "\n"
         if show:
-            self.logger.info(final_report)              # Show on screen
+            self.logger.info(final_report)  # Show on screen
             return None
         return final_report, bands_report
-    
+
     def correct_signal(self, last=False) -> None:
-        '''
+        """
         This function evaluates the k-point signal calculated on previous analysis and attributes
         a new signal value depending only on energy continuity.
-        '''
-        del self.GRAPH              # Clean memory
+        """
+        del self.GRAPH  # Clean memory
         OTHER = 3
         MISTAKE = 1
 
@@ -2913,9 +2999,8 @@ class MATERIAL:
         # Set up the necessary data structures
         ###########################################################################
 
-
-        self.correct_signalfinal = np.copy(self.signal_final)                           # New array to store the corrected signal
-        self.correct_signalfinal[self.signal_final == CORRECT] = CORRECT-1              # Change the CORRECT signal to CORRECT - 1
+        self.correct_signalfinal = np.copy(self.signal_final)  # New array to store the corrected signal
+        self.correct_signalfinal[self.signal_final == CORRECT] = CORRECT - 1  # Change the CORRECT signal to CORRECT - 1
 
         if last:
             # Final pass: validate EVERY attributed slot, not only the POTENTIAL_* ones.
@@ -2926,65 +3011,77 @@ class MATERIAL:
             # DEGENERATE cells keep their marker
             # (ROTATE grading) and FORCED cells keep their audit trail (solve() stamps
             # them FORCED_CONTINUITY right after this returns).
-            sel = ((self.bands_final >= 0) &
-                   (self.signal_final != DEGENERATE) &
-                   (self.signal_final != FORCED))
+            sel = (self.bands_final >= 0) & (self.signal_final != DEGENERATE) & (self.signal_final != FORCED)
             ks, bnds = np.where(sel)
         else:
-            ks_pC, bnds_pC = np.where(self.signal_final == POTENTIAL_CORRECT)           # Select the points marked as POTENTIAL_CORRECT
-            ks_pM, bnds_pM = np.where(self.signal_final == POTENTIAL_MISTAKE)           # Select the points marked as POTENTIAL_MISTAKE
+            ks_pC, bnds_pC = np.where(
+                self.signal_final == POTENTIAL_CORRECT
+            )  # Select the points marked as POTENTIAL_CORRECT
+            ks_pM, bnds_pM = np.where(
+                self.signal_final == POTENTIAL_MISTAKE
+            )  # Select the points marked as POTENTIAL_MISTAKE
 
-            ks = np.concatenate((ks_pC, ks_pM))                                         # Join all k-points
-            bnds = np.concatenate((bnds_pC, bnds_pM))                                   # Join the k-points' bands
+            ks = np.concatenate((ks_pC, ks_pM))  # Join all k-points
+            bnds = np.concatenate((bnds_pC, bnds_pM))  # Join the k-points' bands
 
         ###########################################################################
         # Correct the k-point's signal
         ###########################################################################
         def evaluate_points_chunk(iterator: Union[list, np.ndarray]) -> list:
-            '''
+            """
             Evaluate the energy-continuity signal for a chunk of (k, bn) pairs.
             It only reads shared (read-only) arrays, so it is safe to run in parallel.
-            '''
+            """
             chunk_result = []
             for k, bn in iterator:
-                signal, scores = evaluate_point(self.dimensions, k, bn, self.kpoints_index,
-                                                self.matrix,
-                                                self.bands_final, self.eigenvalues,
-                                                accept_E=self.accept_E, disp_scale=self.disp_scale,
-                                                local_gap=self.local_gap, band_disp=self.band_disp)  # Obtain the new signal
+                signal, scores = evaluate_point(
+                    self.dimensions,
+                    k,
+                    bn,
+                    self.kpoints_index,
+                    self.matrix,
+                    self.bands_final,
+                    self.eigenvalues,
+                    accept_E=self.accept_E,
+                    disp_scale=self.disp_scale,
+                    local_gap=self.local_gap,
+                    band_disp=self.band_disp,
+                )  # Obtain the new signal
                 chunk_result.append([k, bn, signal, scores])
             return chunk_result
 
         # The evaluation of each (k, bn) point is independent, so it is parallelized
         kbnds = list(zip(ks, bnds))
-        evaluated_points = self.parallelize('\t\tCorrecting signal', evaluate_points_chunk, kbnds) \
-            if len(kbnds) > 0 else []
+        evaluated_points = (
+            self.parallelize("\t\tCorrecting signal", evaluate_points_chunk, kbnds) if len(kbnds) > 0 else []
+        )
 
         for k, bn, signal, scores in evaluated_points:
             # Iterate over all k-point signaled as potential points where the energy continuity may fail
-            
+
             if last and self.final_score[bn] > 0.96 and signal == MISTAKE:
                 signal = OTHER
 
-            self.correct_signalfinal[k, bn] = signal                                    # Store this new signal
-            if signal <= OTHER:                 # log only actionable signals (NOT/MIS/DEG/OTH); skip ~11k CORRECT lines/iter
-                self.logger.debug(f'K point: {k} Band: {bn}    New Signal: {signal} Directions: {scores}')
+            self.correct_signalfinal[k, bn] = signal  # Store this new signal
+            if signal <= OTHER:  # log only actionable signals (NOT/MIS/DEG/OTH); skip ~11k CORRECT lines/iter
+                self.logger.debug(f"K point: {k} Band: {bn}    New Signal: {signal} Directions: {scores}")
 
         if last:
             # Observability for the widened final-pass scope: how many slots the
             # in-loop validation had promoted to CORRECT actually fail energy
             # continuity once checked (they are invalidated and refilled below).
-            demoted = int(np.sum((self.signal_final == CORRECT) &
-                                 (self.correct_signalfinal == MISTAKE)))
+            demoted = int(np.sum((self.signal_final == CORRECT) & (self.correct_signalfinal == MISTAKE)))
             if demoted:
-                self.logger.info(f'{BODY_INDENT}Final revalidation: {demoted} in-loop CORRECT '
-                                 f'slot(s) fail energy continuity and were flagged')
+                self.logger.info(
+                    f"{BODY_INDENT}Final revalidation: {demoted} in-loop CORRECT "
+                    f"slot(s) fail energy continuity and were flagged"
+                )
 
         ###########################################################################
         # Create a new problem for another solver iteration
         ###########################################################################
-        k_error, bn_error = np.where(self.correct_signalfinal == MISTAKE)           # Identify Mistakes
-        k_other, bn_other = np.where(self.correct_signalfinal == OTHER)             # Identify k-points with some discontinuity
+        k_error, bn_error = np.where(self.correct_signalfinal == MISTAKE)  # Identify Mistakes
+        k_other, bn_other = np.where(self.correct_signalfinal == OTHER)  # Identify k-points with some discontinuity
 
         ###########################################################################
         # Invalidate the canvas only where the attribution failed energy continuity
@@ -3013,8 +3110,8 @@ class MATERIAL:
         self._enforce_bijection()
 
         total_not_solved = np.sum(self.correct_signalfinal == NOT_SOLVED) + np.sum(self.correct_signalfinal == MISTAKE)
-        self.logger.info(f'\n{BODY_INDENT}Total not solved: ' + str(total_not_solved) + '\n')
-        self.total_not_solved = total_not_solved        # exposed so solve() can pace the alpha sweep by convergence
+        self.logger.info(f"\n{BODY_INDENT}Total not solved: " + str(total_not_solved) + "\n")
+        self.total_not_solved = total_not_solved  # exposed so solve() can pace the alpha sweep by convergence
 
         if last:
             # Final pass: the graph rebuild below (continuity edges + error-region
@@ -3024,11 +3121,13 @@ class MATERIAL:
             self._verify_no_duplicates()
             return
 
-        ks = np.concatenate((k_error, k_other))                                     # Join the k-points marked as a mistake or other signal
-        bnds = np.concatenate((bn_error, bn_other))                                 # Join the k-points' bands
+        ks = np.concatenate((k_error, k_other))  # Join the k-points marked as a mistake or other signal
+        bnds = np.concatenate((bn_error, bn_other))  # Join the k-points' bands
 
-        bands_signaling = np.zeros((self.total_bands, *self.matrix.shape), int)     # The array used to identify the k-points' projection in k-space
-        k_index = self.kpoints_index[ks]                                            # k-points' indeces
+        bands_signaling = np.zeros(
+            (self.total_bands, *self.matrix.shape), int
+        )  # The array used to identify the k-points' projection in k-space
+        k_index = self.kpoints_index[ks]  # k-points' indeces
 
         if self.dimensions == 1:
             ik = k_index
@@ -3041,14 +3140,14 @@ class MATERIAL:
 
         # Mark the k-points' projection in k-space
         if self.dimensions == 1:
-            bands_signaling[bnds, ik] = 1   
+            bands_signaling[bnds, ik] = 1
         elif self.dimensions == 2:
-            bands_signaling[bnds, ik, jk] = 1   
+            bands_signaling[bnds, ik, jk] = 1
         elif self.dimensions == 3:
             bands_signaling[bnds, ik, jk, kk] = 1
 
-        self.GRAPH = nx.Graph()                                                     # The new Graph
-        self.GRAPH.add_nodes_from(np.arange(len(self.vectors)))                     # Set the nodes
+        self.GRAPH = nx.Graph()  # The new Graph
+        self.GRAPH.add_nodes_from(np.arange(len(self.vectors)))  # Set the nodes
         edges = []
 
         # Near-degenerate cells for the glue test below: inside a collapsed gap
@@ -3063,7 +3162,7 @@ class MATERIAL:
         degen_ks = set(int(x) for x in _df[:, 0]) if _df.ndim == 2 and len(_df) else set()
 
         def continuity_edge(kp, kneig, b_p, b_pn):
-            '''
+            """
             Append the continuity edge (same slot at adjacent k-points), UNLESS the
             step it asserts is GLUE: dot product < DP_FORBID with both endpoints
             energy-resolved (outside any near-degenerate group). Such a step is an
@@ -3078,25 +3177,25 @@ class MATERIAL:
             what lets each iteration re-claim the full bands and converge.
             Replacing them with dp-metric weights removed the ratchet and the
             in-loop descent froze at its first fixed point.
-            '''
+            """
             i_neig = np.where(self.neighbors[kp] == kneig)[0]
             if len(i_neig) == 0:
                 return
             dp = float(self.connections[kp, i_neig[0], b_p, b_pn])
             if dp < DP_FORBID and not (_close[kp, b_p] or _close[kneig, b_pn]):
-                return                                              # resolved forbidden step: glue, no edge
+                return  # resolved forbidden step: glue, no edge
             edges.append((int(kp + b_p * self.nks), int(kneig + b_pn * self.nks)))
 
         for bn, band in enumerate(bands_signaling):
             # For each band construct the new graph
-            identify_points = band > 0          # The marked points are considered
-        
+            identify_points = band > 0  # The marked points are considered
+
             if self.dimensions == 1:
-                directions = np.array([1])                                                  # Auxiliary array with the directions to evaluate the edges' existence
+                directions = np.array([1])  # Auxiliary array with the directions to evaluate the edges' existence
                 # If the problem is 1D, the graph is built by the neighbors
                 for k, need_correction in enumerate(identify_points):
                     # For each not identified point the graph is built
-                    kp = self.matrix[k]                                                         # The k-point on position k in k-space
+                    kp = self.matrix[k]  # The k-point on position k in k-space
                     if need_correction and kp not in degen_ks:
                         # If the point was identified as an error or as degenerate
                         # It does not have an edge in the graph
@@ -3104,24 +3203,28 @@ class MATERIAL:
                     for direction in directions:
                         # It is verified for each direction (Down, Right) if the points,
                         # and their neighbors belong to the same band
-                        kn = k + direction                                                      # Neighbor's idices in k-space
+                        kn = k + direction  # Neighbor's idices in k-space
                         if kn >= self.matrix.shape[0]:
                             # The neighbor is outside of the boundaries
                             continue
-                        kneig = self.matrix[kn]                                                 # Neighbor k-point
+                        kneig = self.matrix[kn]  # Neighbor k-point
                         if not identify_points[kn]:
                             b_p = self.bands_final[k, bn]
                             b_pn = self.bands_final[kn, bn]
                             if b_p < 0 or b_pn < 0:
-                                continue                                                        # invalidated cell -> no continuity edge
-                            continuity_edge(kp, kneig, b_p, b_pn)                               # weight-1 ratchet edge unless glue (see continuity_edge)
+                                continue  # invalidated cell -> no continuity edge
+                            continuity_edge(
+                                kp, kneig, b_p, b_pn
+                            )  # weight-1 ratchet edge unless glue (see continuity_edge)
 
             if self.dimensions == 2:
-                directions = np.array([[1, 0], [0, 1]])                                     # Auxiliary array with the directions to evaluate the edges' existence
+                directions = np.array(
+                    [[1, 0], [0, 1]]
+                )  # Auxiliary array with the directions to evaluate the edges' existence
                 for ik, row in enumerate(identify_points):
                     for jk, need_correction in enumerate(row):
                         # For each not identified point the graph is built
-                        kp = self.matrix[ik, jk]                                                        # The k-point on position ik, jk in k-space
+                        kp = self.matrix[ik, jk]  # The k-point on position ik, jk in k-space
                         if need_correction and kp not in degen_ks:
                             # If the point was identified as an error or as degenerate
                             # It does not have an edge in the graph
@@ -3129,25 +3232,29 @@ class MATERIAL:
                         for direction in directions:
                             # It is verified for each direction (Down, Right) if the points,
                             # and their neighbors belong to the same band
-                            ikn, jkn = np.array([ik, jk]) + direction                                   # Neighbor's idices in k-space
+                            ikn, jkn = np.array([ik, jk]) + direction  # Neighbor's idices in k-space
                             if ikn >= self.matrix.shape[0] or jkn >= self.matrix.shape[1]:
                                 # The neighbor is outside of the boundaries
                                 continue
-                            kneig = self.matrix[ikn, jkn]                                               # Neighbor k-point
+                            kneig = self.matrix[ikn, jkn]  # Neighbor k-point
                             if not identify_points[ikn, jkn]:
-                                b_p = self.bands_final[kp, bn]                          # The kpoint's attributed band
-                                b_pn = self.bands_final[kneig, bn]                      # The neighbor's attributed band
+                                b_p = self.bands_final[kp, bn]  # The kpoint's attributed band
+                                b_pn = self.bands_final[kneig, bn]  # The neighbor's attributed band
                                 if b_p < 0 or b_pn < 0:
-                                    continue                                            # invalidated cell -> no continuity edge
-                                continuity_edge(kp, kneig, b_p, b_pn)                   # weight-1 ratchet edge unless glue (see continuity_edge)
+                                    continue  # invalidated cell -> no continuity edge
+                                continuity_edge(
+                                    kp, kneig, b_p, b_pn
+                                )  # weight-1 ratchet edge unless glue (see continuity_edge)
 
             if self.dimensions == 3:
-                directions = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])                        # Auxiliary array with the directions to evaluate the edges' existence
+                directions = np.array(
+                    [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+                )  # Auxiliary array with the directions to evaluate the edges' existence
                 for ik, plane in enumerate(identify_points):
                     for jk, row in enumerate(plane):
                         for kk, need_correction in enumerate(row):
                             # For each not identified point the graph is built
-                            kp = self.matrix[ik, jk, kk]                                                        # The k-point on position ik, jk in k-space
+                            kp = self.matrix[ik, jk, kk]  # The k-point on position ik, jk in k-space
                             if need_correction and kp not in degen_ks:
                                 # If the point was identified as an error or as degenerate
                                 # It does not have an edge in the graph
@@ -3155,24 +3262,32 @@ class MATERIAL:
                             for direction in directions:
                                 # It is verified for each direction (Down, Right) if the points,
                                 # and their neighbors belong to the same band
-                                ikn, jkn, kkn = np.array([ik, jk, kk]) + direction                            # Neighbor's idices in k-space
-                                if ikn >= self.matrix.shape[0] or jkn >= self.matrix.shape[1] or kkn >= self.matrix.shape[2]:
+                                ikn, jkn, kkn = np.array([ik, jk, kk]) + direction  # Neighbor's idices in k-space
+                                if (
+                                    ikn >= self.matrix.shape[0]
+                                    or jkn >= self.matrix.shape[1]
+                                    or kkn >= self.matrix.shape[2]
+                                ):
                                     # The neighbor is outside of the boundaries
                                     continue
-                                kneig = self.matrix[ikn, jkn, kkn]                                            # Neighbor k-point
+                                kneig = self.matrix[ikn, jkn, kkn]  # Neighbor k-point
                                 if not identify_points[ikn, jkn, kkn]:
-                                    b_p = self.bands_final[kp, bn]                            # The kpoint's attributed band
-                                    b_pn = self.bands_final[kneig, bn]                       # The neighbor's attributed band
+                                    b_p = self.bands_final[kp, bn]  # The kpoint's attributed band
+                                    b_pn = self.bands_final[kneig, bn]  # The neighbor's attributed band
                                     if b_p < 0 or b_pn < 0:
-                                        continue                                             # invalidated cell -> no continuity edge
-                                    continuity_edge(kp, kneig, b_p, b_pn)                     # weight-1 ratchet edge unless glue (see continuity_edge)
+                                        continue  # invalidated cell -> no continuity edge
+                                    continuity_edge(
+                                        kp, kneig, b_p, b_pn
+                                    )  # weight-1 ratchet edge unless glue (see continuity_edge)
 
         # Which k-points still carry an error in any band. A k-point is "bad" if any of
         # its slots failed the energy-continuity validation (NOT_SOLVED / MISTAKE / OTHER);
         # these are the nodes that must originate fresh dot-product edges.
-        bad_mask = ((self.correct_signalfinal == NOT_SOLVED) |
-                    (self.correct_signalfinal == MISTAKE) |
-                    (self.correct_signalfinal == OTHER))
+        bad_mask = (
+            (self.correct_signalfinal == NOT_SOLVED)
+            | (self.correct_signalfinal == MISTAKE)
+            | (self.correct_signalfinal == OTHER)
+        )
         bad_k = np.where(np.any(bad_mask, axis=1))[0]
 
         if len(bad_k) > 0:
@@ -3192,9 +3307,11 @@ class MATERIAL:
             ###########################################################################
             all_bands = np.arange(self.total_bands)
             error_nodes = (bad_k[:, None] + all_bands[None, :] * self.nks).ravel()
-            self.logger.info(f'{BODY_INDENT}Error-region rebuild: {len(bad_k)} bad k-point(s), '
-                             f'{len(error_nodes)} node(s) of {len(self.vectors)} '
-                             f'({100.0*len(error_nodes)/max(len(self.vectors),1):.0f}%)')
+            self.logger.info(
+                f"{BODY_INDENT}Error-region rebuild: {len(bad_k)} bad k-point(s), "
+                f"{len(error_nodes)} node(s) of {len(self.vectors)} "
+                f"({100.0 * len(error_nodes) / max(len(self.vectors), 1):.0f}%)"
+            )
             self.make_connections(self.tol, not_first_iteration=True, node_subset=error_nodes)
             self.repeat_communities = True
             for p, pn in edges:
@@ -3203,7 +3320,7 @@ class MATERIAL:
                 # edges (resolved dp < DP_FORBID steps) are excluded above.
                 if self.GRAPH.has_edge(p, pn):
                     # If the edge already exists, the weight is updated
-                    self.GRAPH[p][pn]['weight'] += 1                    # This value can be updated later
+                    self.GRAPH[p][pn]["weight"] += 1  # This value can be updated later
                 else:
                     # Otherwise, the edge is created
                     self.GRAPH.add_edge(p, pn, weight=1)
@@ -3212,7 +3329,7 @@ class MATERIAL:
             # single component, so plain connected-components clustering is correct and
             # cheap. No dot-product edges are needed here.
             self.repeat_communities = False
-            self.GRAPH.add_edges_from(edges)                                                        # Build the identified edges
+            self.GRAPH.add_edges_from(edges)  # Build the identified edges
 
         # Structural anti-shatter safety net: guarantee no node is left isolated,
         # independent of the `tol` threshold or which branch built the graph above.
@@ -3225,12 +3342,12 @@ class MATERIAL:
         self._verify_no_duplicates()
 
     def _verify_no_duplicates(self) -> int:
-        '''
+        """
         Verify that ``self.bands_final`` is a per-k bijection: at each k-point no
         band index is attributed to more than one slot. Unattributed cells (-1) are
         ignored. Logs an explicit OK/violation line and returns the number of excess
         (duplicate) attributions so a caller could gate on it.
-        '''
+        """
         bf = self.bands_final
         nk, nb = bf.shape
         # counts[k, b] = how many slots at k hold band index b (ignoring -1).
@@ -3242,16 +3359,19 @@ class MATERIAL:
         excess = int((counts[dup] - 1).sum())
         if excess:
             dup_k = int(np.any(dup, axis=1).sum())
-            self.logger.warning(f'{BODY_INDENT}Duplicate-attribution check: bijection VIOLATED -- '
-                                f'{dup_k} k-point(s) hold a band index in >1 slot '
-                                f'({excess} excess attribution(s))')
+            self.logger.warning(
+                f"{BODY_INDENT}Duplicate-attribution check: bijection VIOLATED -- "
+                f"{dup_k} k-point(s) hold a band index in >1 slot "
+                f"({excess} excess attribution(s))"
+            )
         else:
-            self.logger.info(f'{BODY_INDENT}Duplicate-attribution check: OK '
-                             f'(every k-point maps each band to at most one slot)')
+            self.logger.info(
+                f"{BODY_INDENT}Duplicate-attribution check: OK (every k-point maps each band to at most one slot)"
+            )
         return excess
 
     def _verify_no_cliffs(self) -> int:
-        '''
+        """
         Final continuity invariant: no band-slot may ship a raw-band SWITCH across
         an energy step larger than the local continuity gate (see
         ``_cliff_seam_edges``) -- the sub-accept_E cliffs the flat gross-jump gate
@@ -3262,7 +3382,7 @@ class MATERIAL:
         the report downgrades those bands to CHECK/FAIL instead of shipping a
         silent USABLE band, and logs a loud warning. Soft like the bijection check
         -- it does not raise. Returns the number of surviving cliff edges.
-        '''
+        """
         edges = self._cliff_seam_edges()
         nslots = self.bands_final.shape[1]
         counts = np.zeros(nslots, dtype=int)
@@ -3274,16 +3394,16 @@ class MATERIAL:
             slots = sorted({int(s) for _j, _k, _kn, s in edges})
             wj, wk, wkn, ws = edges[0]
             self.logger.warning(
-                f'{BODY_INDENT}Cliff check: {len(edges)} intra-slot energy cliff(s) '
-                f'survive in slot(s) {slots} (worst {wj:.4g} Ry at slot {ws}, '
-                f'k={wk}<->{wkn}) -- these bands are graded CHECK/FAIL, not silently USABLE')
+                f"{BODY_INDENT}Cliff check: {len(edges)} intra-slot energy cliff(s) "
+                f"survive in slot(s) {slots} (worst {wj:.4g} Ry at slot {ws}, "
+                f"k={wk}<->{wkn}) -- these bands are graded CHECK/FAIL, not silently USABLE"
+            )
         else:
-            self.logger.info(f'{BODY_INDENT}Cliff check: OK '
-                             f'(no sub-gate intra-slot energy cliffs)')
+            self.logger.info(f"{BODY_INDENT}Cliff check: OK (no sub-gate intra-slot energy cliffs)")
         return len(edges)
 
     def _verify_no_dp_cycles(self) -> int:
-        '''
+        """
         Final wavefunction-continuity invariant: no band-slot may ship a raw-band
         SWITCH that breaks a CERTAIN dp link (see ``_dp_refuted_seam_edges``) --
         the energy-quiet permutation cycles that pass every energy gate yet are a
@@ -3295,7 +3415,7 @@ class MATERIAL:
         those bands to CHECK/FAIL instead of shipping a silent USABLE band, and
         logs a loud warning. Soft like the cliff/bijection checks -- it does not
         raise. Returns the number of surviving refuted edges.
-        '''
+        """
         edges = self._dp_refuted_seam_edges()
         nslots = self.bands_final.shape[1]
         counts = np.zeros(nslots, dtype=int)
@@ -3307,17 +3427,17 @@ class MATERIAL:
             slots = sorted({int(s) for _v, _k, _kn, s in edges})
             wv, wk, wkn, ws = edges[0]
             self.logger.warning(
-                f'{BODY_INDENT}dp-cycle check: {len(edges)} wavefunction-broken '
-                f'seam edge(s) survive in slot(s) {slots} (worst dp {wv:.3g} at '
-                f'slot {ws}, k={wk}<->{wkn}) -- these bands are graded CHECK/FAIL/'
-                f'ROTATE, not silently USABLE')
+                f"{BODY_INDENT}dp-cycle check: {len(edges)} wavefunction-broken "
+                f"seam edge(s) survive in slot(s) {slots} (worst dp {wv:.3g} at "
+                f"slot {ws}, k={wk}<->{wkn}) -- these bands are graded CHECK/FAIL/"
+                f"ROTATE, not silently USABLE"
+            )
         else:
-            self.logger.info(f'{BODY_INDENT}dp-cycle check: OK '
-                             f'(no wavefunction-broken seam edges)')
+            self.logger.info(f"{BODY_INDENT}dp-cycle check: OK (no wavefunction-broken seam edges)")
         return len(edges)
 
     def _handoff_dp_residue_to_rotation(self) -> int:
-        '''
+        """
         Conservative basisrotation handoff for the dp-broken seams
         ``_repair_dp_cycles`` could not remove. The strict refuted census already
         excludes cells whose two SWITCHING bands are near-degenerate; a survivor
@@ -3332,12 +3452,12 @@ class MATERIAL:
         so the handed-off cells leave the refuted census (now DEGENERATE-exempt)
         and land in the report's Degen/ROTATE column instead. Returns the number
         of cells handed off.
-        '''
+        """
         edges = self._dp_refuted_seam_edges()
         if not edges:
             return 0
         ev = self.eigenvalues
-        ethr = getattr(self, 'degen_ethr', 0.005)
+        ethr = getattr(self, "degen_ethr", 0.005)
         nbnd = ev.shape[1]
         handed: list = []
         seen: set = set()
@@ -3354,33 +3474,37 @@ class MATERIAL:
                 elif b + 1 < nbnd and abs(ev[kk, b + 1] - ev[kk, b]) < ethr:
                     adj = b + 1
                 if adj < 0:
-                    continue                          # no degeneracy: keep CHECK grade
+                    continue  # no degeneracy: keep CHECK grade
                 self.signal_final[kk, s] = DEGENERATE
                 self.correct_signalfinal[kk, s] = DEGENERATE
                 handed.append([kk, b, adj])
                 seen.add((kk, s))
         if not handed:
-            self.logger.info(f'{BODY_INDENT}dp-residue handoff: no near-degenerate gauge '
-                             f'seam among the {len(edges)} surviving dp break(s) '
-                             f'(all graded CHECK/FAIL)')
+            self.logger.info(
+                f"{BODY_INDENT}dp-residue handoff: no near-degenerate gauge "
+                f"seam among the {len(edges)} surviving dp break(s) "
+                f"(all graded CHECK/FAIL)"
+            )
             return 0
         handed_arr = np.array(handed, dtype=int)
-        existing = getattr(self, 'degenerate_final', None)
+        existing = getattr(self, "degenerate_final", None)
         if existing is not None and len(existing) > 0:
             self.degenerate_final = np.vstack([np.asarray(existing), handed_arr])
         else:
             self.degenerate_final = handed_arr
-        self.logger.info(f'{BODY_INDENT}dp-residue handoff: {len(handed)} near-degenerate '
-                         f'gauge seam cell(s) marked DEGENERATE for basisrotation')
+        self.logger.info(
+            f"{BODY_INDENT}dp-residue handoff: {len(handed)} near-degenerate "
+            f"gauge seam cell(s) marked DEGENERATE for basisrotation"
+        )
         return len(handed)
 
     def _slot_energy_penalty(self, k: int, c: int, b: int) -> float:
-        '''
+        """
         Energy mismatch of putting band ``b`` in slot ``c`` at k-point ``k``: the mean
         |E(k,b) - E(neighbour, band-currently-in-slot-c)| over the k-point's attributed
         neighbours in that slot. Falls back to |E(k,b) - E(k,c)| (slot index used as the
         band-energy proxy) when slot c has no attributed neighbour. Lower is better.
-        '''
+        """
         Eb = float(self.eigenvalues[k, b])
         diffs = []
         for kn in self.neighbors[k]:
@@ -3395,7 +3519,7 @@ class MATERIAL:
         return abs(Eb - float(self.eigenvalues[k, c]))
 
     def _resolve_degenerate_groups(self, ethr: float = None) -> int:
-        '''
+        """
         Complete energy-isolated near-degenerate band groups by a per-k bijection.
 
         For each k the bands are partitioned by energy gap: adjacent (energy-sorted)
@@ -3419,24 +3543,24 @@ class MATERIAL:
         ``ethr`` defaults to ``self.degen_ethr`` (0.005 Ry ~ 68 meV; eigenvalues.npy
         is stored in Ry -- the same scale degenrotation groups on, and the centre of
         the ~3-8 mRy stability plateau). Returns the number of slots filled.
-        '''
+        """
         if ethr is None:
-            ethr = getattr(self, 'degen_ethr', 0.005)
-        bf  = self.bands_final
+            ethr = getattr(self, "degen_ethr", 0.005)
+        bf = self.bands_final
         csf = self.correct_signalfinal
-        nb  = bf.shape[1]
+        nb = bf.shape[1]
         filled = 0
-        grown  = 0
-        resolved = {}                                                   # slot -> [k, ...] for the verbose dump
+        grown = 0
+        resolved = {}  # slot -> [k, ...] for the verbose dump
 
         for k in range(self.nks):
             e = self.eigenvalues[k]
             lo = 0
             for b in range(1, nb + 1):
                 if b < nb and (e[b] - e[b - 1]) < ethr:
-                    continue                                            # still inside the current group
-                hi = b - 1                                              # close group of bands [lo, hi]
-                if hi > lo:                                             # degenerate group (singletons skipped)
+                    continue  # still inside the current group
+                hi = b - 1  # close group of bands [lo, hi]
+                if hi > lo:  # degenerate group (singletons skipped)
                     # Whole-ROW census, not group-slot census: when bands cross, the
                     # dp tracking legitimately parks a group band at an out-of-group
                     # slot (e.g. the mirror-axis rows where band 5 sits at slot 7).
@@ -3448,8 +3572,7 @@ class MATERIAL:
                     for v in bf[k]:
                         if v >= 0:
                             row_counts[int(v)] = row_counts.get(int(v), 0) + 1
-                    miss = [bd for bd in range(lo, hi + 1)
-                            if row_counts.get(bd, 0) == 0]
+                    miss = [bd for bd in range(lo, hi + 1) if row_counts.get(bd, 0) == 0]
                     if miss:
                         if hi - lo + 1 > 2:
                             grown += 1
@@ -3457,38 +3580,48 @@ class MATERIAL:
                         # duplicated elsewhere in the row; a slot holding a unique
                         # band (in- or out-of-group) keeps its dp-chosen value --
                         # overwriting it would orphan that band.
-                        free = [s for s in range(lo, hi + 1)
-                                if int(bf[k, s]) < 0
-                                or row_counts.get(int(bf[k, s]), 0) > 1]
+                        free = [
+                            s for s in range(lo, hi + 1) if int(bf[k, s]) < 0 or row_counts.get(int(bf[k, s]), 0) > 1
+                        ]
                         miss_set = set(miss)
+
                         def _fill(s, bd):
                             old = int(bf[k, s])
                             if old >= 0:
                                 row_counts[old] -= 1
-                            bf[k, s] = bd; csf[k, s] = FORCED_CONTINUITY
+                            bf[k, s] = bd
+                            csf[k, s] = FORCED_CONTINUITY
                             row_counts[bd] = row_counts.get(bd, 0) + 1
-                        for s in [s for s in free if s in miss_set]:    # identity first (slot == band)
+
+                        for s in [s for s in free if s in miss_set]:  # identity first (slot == band)
                             _fill(s, s)
-                            miss_set.discard(s); free.remove(s); filled += 1
+                            miss_set.discard(s)
+                            free.remove(s)
+                            filled += 1
                             resolved.setdefault(s, []).append(k)
-                        for s, bd in zip(free, sorted(miss_set)):       # pair any leftovers in energy order
-                            _fill(s, bd); filled += 1
+                        for s, bd in zip(free, sorted(miss_set)):  # pair any leftovers in energy order
+                            _fill(s, bd)
+                            filled += 1
                             resolved.setdefault(bd, []).append(k)
-                lo = b                                                  # next group starts here
+                lo = b  # next group starts here
 
         if filled:
-            self.logger.info(f'{BODY_INDENT}Degenerate-group completion: filled {filled} slot(s) '
-                             f'in {grown} grown block(s) by within-group bijection '
-                             f'(gap < {ethr * 1000:.1f} mRy)')
+            self.logger.info(
+                f"{BODY_INDENT}Degenerate-group completion: filled {filled} slot(s) "
+                f"in {grown} grown block(s) by within-group bijection "
+                f"(gap < {ethr * 1000:.1f} mRy)"
+            )
             if self.logger.level <= logging.DEBUG:
                 for bd in sorted(resolved):
                     ks = resolved[bd]
-                    self.logger.debug(f'{BODY_INDENT}  slot {bd}: completed at {len(ks)} k-point(s) '
-                                      f'by degenerate-group bijection: {ks}')
+                    self.logger.debug(
+                        f"{BODY_INDENT}  slot {bd}: completed at {len(ks)} k-point(s) "
+                        f"by degenerate-group bijection: {ks}"
+                    )
         return filled
 
     def _enforce_bijection(self) -> int:
-        '''
+        """
         Make ``self.bands_final`` a per-k permutation, repairing both bijection defects:
 
           (a) DUPLICATE: a band attributed to more than one slot. The copy in the best
@@ -3506,23 +3639,23 @@ class MATERIAL:
               partition dropped -- see the get_cluster_score cross-band veto.
 
         Returns the total number of slots reassigned or filled.
-        '''
+        """
         bf = self.bands_final
         sig = self.correct_signalfinal
         nk, nb = bf.shape
-        accept_E = getattr(self, 'accept_E', np.inf)                                # gross-jump gate for the gap branch
-        reassigned = 0                                                              # (a) duplicate-loser reassignments
-        filled = 0                                                                  # (b) empty-slot gap fills
-        dbg = self.logger.level <= logging.DEBUG                                    # verbose (-v): per-action trace
+        accept_E = getattr(self, "accept_E", np.inf)  # gross-jump gate for the gap branch
+        reassigned = 0  # (a) duplicate-loser reassignments
+        filled = 0  # (b) empty-slot gap fills
+        dbg = self.logger.level <= logging.DEBUG  # verbose (-v): per-action trace
         for k in range(nk):
-            row = bf[k]                                                             # view: reflects edits made below
-            where = {}                                                              # band value -> slots holding it (attributed only)
+            row = bf[k]  # view: reflects edits made below
+            where = {}  # band value -> slots holding it (attributed only)
             for c in range(nb):
                 v = int(row[c])
                 if v >= 0:
                     where.setdefault(v, []).append(c)
             dup_vals = [v for v, cs in where.items() if len(cs) > 1]
-            missing = [b for b in range(self.total_bands) if b not in where]        # bands absent from the whole row
+            missing = [b for b in range(self.total_bands) if b not in where]  # bands absent from the whole row
 
             # (a) Duplicate branch (unchanged): move each duplicate's losing slot(s)
             #     onto a missing band by best energy fit, ungated.
@@ -3541,47 +3674,58 @@ class MATERIAL:
                     cs = where[v]
                     keep = max(cs, key=lambda c: (_rank(c), -self._slot_energy_penalty(k, c, v)))
                     loser_slots.extend(c for c in cs if c != keep)
-                pairs = sorted(((self._slot_energy_penalty(k, c, b), c, b)
-                                for c in loser_slots for b in missing),
-                               key=lambda t: t[0])
+                pairs = sorted(
+                    ((self._slot_energy_penalty(k, c, b), c, b) for c in loser_slots for b in missing),
+                    key=lambda t: t[0],
+                )
                 used_c, used_b = set(), set()
                 for _pen, c, b in pairs:
                     if c in used_c or b in used_b:
                         continue
-                    if dbg and sig[k, c] >= POTENTIAL_CORRECT:    # only audit dups that evict a (near-)solved slot; routine churn is in the INFO summary
-                        self.logger.debug(f'{BODY_INDENT}  [bijection] dup  k={k} slot={c}: '
-                                          f'band {int(bf[k, c])}(duplicate)->{b}  penalty={_pen:.4f}')
+                    if (
+                        dbg and sig[k, c] >= POTENTIAL_CORRECT
+                    ):  # only audit dups that evict a (near-)solved slot; routine churn is in the INFO summary
+                        self.logger.debug(
+                            f"{BODY_INDENT}  [bijection] dup  k={k} slot={c}: "
+                            f"band {int(bf[k, c])}(duplicate)->{b}  penalty={_pen:.4f}"
+                        )
                     bf[k, c] = b
-                    used_c.add(c); used_b.add(b)
+                    used_c.add(c)
+                    used_b.add(b)
                     reassigned += 1
-                missing = [b for b in missing if b not in used_b]                   # bands consumed above are no longer missing
+                missing = [b for b in missing if b not in used_b]  # bands consumed above are no longer missing
 
             # (b) Gap branch (new): pair empty slots to remaining missing bands, one-to-
             #     one by smallest energy penalty first, gated by accept_E.
             empty_slots = [c for c in range(nb) if int(row[c]) == -1]
             if empty_slots and missing:
-                pairs = sorted(((self._slot_energy_penalty(k, c, b), c, b)
-                                for c in empty_slots for b in missing),
-                               key=lambda t: t[0])
+                pairs = sorted(
+                    ((self._slot_energy_penalty(k, c, b), c, b) for c in empty_slots for b in missing),
+                    key=lambda t: t[0],
+                )
                 used_c, used_b = set(), set()
                 for pen, c, b in pairs:
                     if c in used_c or b in used_b:
                         continue
-                    if pen > accept_E:                                              # nothing continuous fits: leave -1
+                    if pen > accept_E:  # nothing continuous fits: leave -1
                         continue
                     if dbg:
-                        self.logger.debug(f'{BODY_INDENT}  [bijection] gap  k={k} slot={c}: '
-                                          f'-1->band {b}  penalty={pen:.4f}')
+                        self.logger.debug(
+                            f"{BODY_INDENT}  [bijection] gap  k={k} slot={c}: -1->band {b}  penalty={pen:.4f}"
+                        )
                     bf[k, c] = b
-                    used_c.add(c); used_b.add(b)
+                    used_c.add(c)
+                    used_b.add(b)
                     filled += 1
         if reassigned or filled:
-            self.logger.info(f'{BODY_INDENT}Bijection enforcement: reassigned {reassigned} '
-                             f'duplicate slot(s) and filled {filled} empty slot(s) with missing bands')
+            self.logger.info(
+                f"{BODY_INDENT}Bijection enforcement: reassigned {reassigned} "
+                f"duplicate slot(s) and filled {filled} empty slot(s) with missing bands"
+            )
         return reassigned + filled
 
-    def _dp_support_counts(self, tol: float = None) -> Tuple[np.ndarray, np.ndarray]:
-        '''
+    def _dp_support_counts(self, tol: float = None) -> tuple[np.ndarray, np.ndarray]:
+        """
         Per-cell dot-product support of the current attribution: for every (k, slot)
         count the directions whose edge connects the cell's assigned band to the band
         assigned to the SAME slot at the neighbouring k-point with dp >= ``tol``
@@ -3594,7 +3738,7 @@ class MATERIAL:
         neighbour: the wavefunction evidence contradicts the attribution no matter
         how quiet the energy is. This is the signature of a label swap between
         near-parallel bands.
-        '''
+        """
         if tol is None:
             tol = DP_SUP_TOL
         bf = self.bands_final
@@ -3607,20 +3751,18 @@ class MATERIAL:
             kn = neigh[:, d]
             ok = kn >= 0
             kn_safe = np.where(ok, kn, 0)
-            b1 = bf                                                     # band in this cell
-            b2 = bf[kn_safe]                                            # band in the same slot at the d-neighbour
+            b1 = bf  # band in this cell
+            b2 = bf[kn_safe]  # band in the same slot at the d-neighbour
             comparable = ok[:, None] & (b1 >= 0) & (b2 >= 0)
-            vals = self.connections[idx[:, None], d,
-                                    np.where(comparable, b1, 0),
-                                    np.where(comparable, b2, 0)]
+            vals = self.connections[idx[:, None], d, np.where(comparable, b1, 0), np.where(comparable, b2, 0)]
             tot += comparable
             sup += comparable & (vals >= tol)
         return sup, tot
 
     def _certain_sheet_forest(self) -> np.ndarray:
-        '''
+        """
         The maximal collision-free certain forest (the "sheets"). POST-LOOP
-        MEASUREMENT ONLY: the in-loop locking that once consumed this 
+        MEASUREMENT ONLY: the in-loop locking that once consumed this
         froze the sweep and was removed Jul 2026. The measurement
         itself is sound and feeds the post-loop seam passes (refusal cuts =
         free seam locations) and a future sheet-guided relabel.
@@ -3640,26 +3782,24 @@ class MATERIAL:
         Returns ``sheet_id`` (nks, nbnd) int32, -1 for singleton states, and
         caches ``self.sheet_id`` and ``self._sheet_members`` {sid: [state ids]}.
         The connections array is static input, so this is computed once.
-        '''
-        cached = getattr(self, 'sheet_id', None)
+        """
+        cached = getattr(self, "sheet_id", None)
         if cached is not None:
             return cached
         nks, nb = self.nks, self.nbnd
-        conn = self.connections                                     # (nks, ndirs, nbnd, nbnd)
+        conn = self.connections  # (nks, ndirs, nbnd, nbnd)
         part = np.argmax(conn, axis=3)
         best = np.take_along_axis(conn, part[..., None], axis=3)[..., 0]
         neigh = np.asarray(self.neighbors)
 
-        links = []                                                  # (dp, state_a, state_b)
+        links = []  # (dp, state_a, state_b)
         for d in range(self.number_neighbors):
             kn = neigh[:, d]
             for b in range(nb):
                 sel = (kn >= 0) & (best[:, d, b] >= DP_CERTAIN)
                 for k in np.where(sel)[0]:
-                    links.append((float(best[k, d, b]),
-                                  int(k) + b * nks,
-                                  int(kn[k]) + int(part[k, d, b]) * nks))
-        links.sort(key=lambda t: -t[0])                             # strongest first
+                    links.append((float(best[k, d, b]), int(k) + b * nks, int(kn[k]) + int(part[k, d, b]) * nks))
+        links.sort(key=lambda t: -t[0])  # strongest first
 
         parent = np.arange(nks * nb)
 
@@ -3667,11 +3807,11 @@ class MATERIAL:
             root = x
             while parent[root] != root:
                 root = parent[root]
-            while parent[x] != root:                                # path compression
+            while parent[x] != root:  # path compression
                 parent[x], x = root, parent[x]
             return root
 
-        ksets: dict = {}                                            # root -> set of k it covers
+        ksets: dict = {}  # root -> set of k it covers
 
         def kset(r: int) -> set:
             s = ksets.get(r)
@@ -3684,12 +3824,12 @@ class MATERIAL:
         for _, a, c in links:
             ra, rc = find(a), find(c)
             if ra == rc:
-                continue                                            # consistent cycle inside a sheet
+                continue  # consistent cycle inside a sheet
             sa, sc = kset(ra), kset(rc)
             if len(sa) < len(sc):
                 ra, rc, sa, sc = rc, ra, sc, sa
             if sa & sc:
-                refused_links.append((a, c))                        # frustrated loop: branch cut stays open
+                refused_links.append((a, c))  # frustrated loop: branch cut stays open
                 continue
             parent[rc] = ra
             sa |= sc
@@ -3718,14 +3858,16 @@ class MATERIAL:
 
         sizes = sorted((len(m) for m in self._sheet_members.values()), reverse=True)
         covered = int(sum(sizes))
-        self.logger.info(f'{BODY_INDENT}Certain-sheet forest: {len(links)} certain link(s), '
-                         f'{refused} refused (same-k collision = branch cuts), '
-                         f'{sid} sheet(s) covering {covered}/{nks*nb} states '
-                         f'({100.0*covered/(nks*nb):.1f}%); largest: {sizes[:10]}')
+        self.logger.info(
+            f"{BODY_INDENT}Certain-sheet forest: {len(links)} certain link(s), "
+            f"{refused} refused (same-k collision = branch cuts), "
+            f"{sid} sheet(s) covering {covered}/{nks * nb} states "
+            f"({100.0 * covered / (nks * nb):.1f}%); largest: {sizes[:10]}"
+        )
         return sheet_id
 
     def _certain_partner_map(self, threshold: float = DP_CERTAIN) -> np.ndarray:
-        '''
+        """
         ``cert[k, d, b]`` = the unique raw band at neighbour ``d`` of ``k`` whose
         dot product with raw band ``b`` at ``k`` is >= ``threshold`` (default
         ``DP_CERTAIN``), or -1 when no such partner exists (or the neighbour is
@@ -3735,31 +3877,31 @@ class MATERIAL:
         partner can clear any threshold above 1/sqrt(2) ~ 0.707, and a certain
         partner caps every rival at sqrt(1 - threshold^2). Cached per threshold
         -- the connections array is static input.
-        '''
-        cached = getattr(self, '_cert_maps', None)
+        """
+        cached = getattr(self, "_cert_maps", None)
         if cached is None:
             cached = self._cert_maps = {}
         if threshold in cached:
             return cached[threshold]
-        conn = self.connections                                     # (nks, ndirs, nbnd, nbnd)
+        conn = self.connections  # (nks, ndirs, nbnd, nbnd)
         part = np.argmax(conn, axis=3)
         best = np.take_along_axis(conn, part[..., None], axis=3)[..., 0]
         cert = np.where(best >= threshold, part, -1).astype(np.int32)
-        cert[np.asarray(self.neighbors) == -1] = -1                 # no neighbour that way
+        cert[np.asarray(self.neighbors) == -1] = -1  # no neighbour that way
         cached[threshold] = cert
         return cert
 
     def _near_degenerate_mask(self) -> np.ndarray:
-        '''
+        """
         ``close[k, b]`` = the (k, band) cell sits inside a collapsed gap
         (adjacent-band spacing < degen_ethr). There a vanishing overlap is
         gauge, not evidence, so certain-link accounting and seam costs exempt
         these cells. Cached -- eigenvalues are static input.
-        '''
-        cached = getattr(self, '_near_degen_mask', None)
+        """
+        cached = getattr(self, "_near_degen_mask", None)
         if cached is not None:
             return cached
-        ethr = getattr(self, 'degen_ethr', 0.005)
+        ethr = getattr(self, "degen_ethr", 0.005)
         dE_close = np.diff(self.eigenvalues, axis=1) < ethr
         close = np.zeros(self.eigenvalues.shape, bool)
         close[:, 1:] |= dE_close
@@ -3768,11 +3910,11 @@ class MATERIAL:
         return close
 
     def _dir_index(self) -> dict:
-        '''
+        """
         ``{(k1, k2): d}`` for every ordered neighbour pair -- the direction
         index needed to look a step up in the connections array. Cached.
-        '''
-        cached = getattr(self, '_dir_idx_map', None)
+        """
+        cached = getattr(self, "_dir_idx_map", None)
         if cached is not None:
             return cached
         neigh = np.asarray(self.neighbors)
@@ -3785,7 +3927,7 @@ class MATERIAL:
         return dir_idx
 
     def _repair_certain_links(self, max_rounds: int = 16) -> int:
-        '''
+        """
         Post-loop wavefunction-evidence repair: at every energy-broken k-point
         row, each slot takes the band its trusted neighbours' CERTAIN successors
         mandate.
@@ -3842,7 +3984,7 @@ class MATERIAL:
         energy-continuity signal of their same-slot neighbours is re-graded, so
         the report grades what is actually shipped. Returns the number of
         changed cells.
-        '''
+        """
         bf = self.bands_final
         nks, nslots = bf.shape
         nbnd = self.connections.shape[2]
@@ -3863,7 +4005,7 @@ class MATERIAL:
         close = self._near_degenerate_mask()
 
         changed_cells: list = []
-        frozen: set = set()                                          # cells changed once stay put
+        frozen: set = set()  # cells changed once stay put
         n_revert = n_ambig = 0
         n_trigger0 = 0
 
@@ -3872,7 +4014,7 @@ class MATERIAL:
             # 1. Trigger cells and trusted anchors on the current canvas.
             ###########################################################################
             bad = (bf < 0) | np.isin(self.correct_signalfinal, (NOT_SOLVED, MISTAKE))
-            for d in range(n_dir):                                   # gross same-slot energy jumps
+            for d in range(n_dir):  # gross same-slot energy jumps
                 kn_col = neigh[:, d]
                 ok = kn_col >= 0
                 kn_s = np.where(ok, kn_col, 0)
@@ -3900,7 +4042,7 @@ class MATERIAL:
             #    is that patches whose trusted rim is thinner than the wrong core
             #    stay (honestly) broken.
             ###########################################################################
-            proposals: dict = {}                                     # k -> [(slot, band)]
+            proposals: dict = {}  # k -> [(slot, band)]
             for k in np.where(bad.any(axis=1))[0]:
                 k = int(k)
                 row_props = {}
@@ -3920,15 +4062,15 @@ class MATERIAL:
                     if len(exps) != 1:
                         if len(exps) > 1:
                             n_ambig += 1
-                        continue                                     # no unanimous mandate
+                        continue  # no unanimous mandate
                     b_exp = exps.pop()
                     if close[k, b_exp] or (bf[k, s] >= 0 and close[k, int(bf[k, s])]):
-                        continue                                     # gauge territory: hands off
+                        continue  # gauge territory: hands off
                     if b_exp == int(bf[k, s]):
                         continue
                     if (k, s) in frozen:
-                        continue                                     # no flip-flopping across rounds
-                    if b_exp in mandated_bands:                      # two slots mandated one band
+                        continue  # no flip-flopping across rounds
+                    if b_exp in mandated_bands:  # two slots mandated one band
                         row_props.pop(mandated_bands[b_exp], None)
                         n_ambig += 1
                         continue
@@ -3954,7 +4096,7 @@ class MATERIAL:
                     new_row[s] = b
                     moved.add(int(b))
                     targets.add(int(s))
-                for s in range(nslots):                              # vacate the moved bands' old slots
+                for s in range(nslots):  # vacate the moved bands' old slots
                     if s not in targets and int(old_row[s]) in moved:
                         new_row[s] = -1
                 empty = [s for s in range(nslots) if int(new_row[s]) == -1]
@@ -3973,7 +4115,7 @@ class MATERIAL:
                         new_row[empty[c_]] = free[r_]
                 vals = new_row[new_row >= 0]
                 if len(np.unique(vals)) != len(vals) or (new_row == -1).sum() > (old_row == -1).sum():
-                    n_revert += 1                                    # bijection safety first
+                    n_revert += 1  # bijection safety first
                     continue
                 diff = np.where(new_row != old_row)[0]
                 # A changed cell must keep at least one dp-supported direction
@@ -4005,27 +4147,34 @@ class MATERIAL:
                 changed_cells.extend((int(k), int(s)) for s in diff)
                 frozen.update((int(k), int(s)) for s in diff)
                 round_changed += len(diff)
-            self.logger.debug(f'{BODY_INDENT}  [cert-repair] round {round_ + 1}: '
-                              f'{int(bad.sum())} trigger cell(s), {len(proposals)} row(s) '
-                              f'with mandates, {round_changed} cell(s) changed')
+            self.logger.debug(
+                f"{BODY_INDENT}  [cert-repair] round {round_ + 1}: "
+                f"{int(bad.sum())} trigger cell(s), {len(proposals)} row(s) "
+                f"with mandates, {round_changed} cell(s) changed"
+            )
             if round_changed == 0:
                 break
 
         if n_trigger0:
-            self.logger.info(f'{BODY_INDENT}Certain-link repair: {n_trigger0} energy-broken/'
-                             f'unattributed cell(s) triggered; certain-successor mandates changed '
-                             f'{len(changed_cells)} cell(s) at '
-                             f'{len(set(k for k, _ in changed_cells))} k-point(s) '
-                             f'over {round_ + 1} round(s)'
-                             + (f', {n_ambig} ambiguous mandate(s) skipped' if n_ambig else '')
-                             + (f', {n_revert} row(s) reverted' if n_revert else ''))
+            self.logger.info(
+                f"{BODY_INDENT}Certain-link repair: {n_trigger0} energy-broken/"
+                f"unattributed cell(s) triggered; certain-successor mandates changed "
+                f"{len(changed_cells)} cell(s) at "
+                f"{len(set(k for k, _ in changed_cells))} k-point(s) "
+                f"over {round_ + 1} round(s)"
+                + (f", {n_ambig} ambiguous mandate(s) skipped" if n_ambig else "")
+                + (f", {n_revert} row(s) reverted" if n_revert else "")
+            )
             for k, s in changed_cells:
-                self.logger.debug(f'{BODY_INDENT}  [cert-repair] k={k} slot={s}: '
-                                  f'band ->{int(bf[k, s])}  '
-                                  f'E={float(self.eigenvalues[k, bf[k, s]]) if bf[k, s] >= 0 else np.nan:.4f}')
+                self.logger.debug(
+                    f"{BODY_INDENT}  [cert-repair] k={k} slot={s}: "
+                    f"band ->{int(bf[k, s])}  "
+                    f"E={float(self.eigenvalues[k, bf[k, s]]) if bf[k, s] >= 0 else np.nan:.4f}"
+                )
         else:
-            self.logger.info(f'{BODY_INDENT}Certain-link repair: no energy-broken or '
-                             f'unattributed cells (nothing to do)')
+            self.logger.info(
+                f"{BODY_INDENT}Certain-link repair: no energy-broken or unattributed cells (nothing to do)"
+            )
         if not changed_cells:
             return 0
 
@@ -4054,29 +4203,37 @@ class MATERIAL:
                         if b2 < 0:
                             continue
                         values.append(self.connections[k, i_neig, b1, b2])
-                    self.signal_final[k, s] = min(evaluate_result(values) if values else NOT_SOLVED,
-                                                  POTENTIAL_CORRECT)
-                if hasattr(self, 'forced_mask'):
-                    self.forced_mask[k, s] = False                   # a mandate is not a force-fill
+                    self.signal_final[k, s] = min(evaluate_result(values) if values else NOT_SOLVED, POTENTIAL_CORRECT)
+                if hasattr(self, "forced_mask"):
+                    self.forced_mask[k, s] = False  # a mandate is not a force-fill
             elif self.correct_signalfinal[k, s] == FORCED_CONTINUITY:
                 continue
             if int(bf[k, s]) < 0:
                 self.correct_signalfinal[k, s] = NOT_SOLVED
                 continue
-            sig, _ = evaluate_point(self.dimensions, k, s, self.kpoints_index,
-                                    self.matrix, bf, self.eigenvalues,
-                                    accept_E=self.accept_E, disp_scale=self.disp_scale,
-                                    local_gap=self.local_gap, band_disp=self.band_disp)
+            sig, _ = evaluate_point(
+                self.dimensions,
+                k,
+                s,
+                self.kpoints_index,
+                self.matrix,
+                bf,
+                self.eigenvalues,
+                accept_E=self.accept_E,
+                disp_scale=self.disp_scale,
+                local_gap=self.local_gap,
+                band_disp=self.band_disp,
+            )
             self.correct_signalfinal[k, s] = sig
         return len(changed_cells)
 
     def _slot_wall_edges(self) -> list:
-        '''
+        """
         Every undirected same-slot adjacency whose energy step is a gross jump
         (> accept_E), as ``(jump, k, kn, slot)`` sorted worst first -- the edge set
         behind both the Silent report column and the visible cliffs. Degenerate-
         signalled endpoints are excluded (their label is gauge).
-        '''
+        """
         bf = self.bands_final
         ev = self.eigenvalues
         neigh = np.asarray(self.neighbors)
@@ -4087,9 +4244,13 @@ class MATERIAL:
             kn_col = neigh[:, d]
             ok = kn_col >= 0
             kns = np.where(ok, kn_col, 0)
-            comp = (ok & (karr < kns))[:, None] & (bf >= 0) & (bf[kns] >= 0) \
-                   & (self.signal_final != DEGENERATE) \
-                   & (self.signal_final[kns] != DEGENERATE)
+            comp = (
+                (ok & (karr < kns))[:, None]
+                & (bf >= 0)
+                & (bf[kns] >= 0)
+                & (self.signal_final != DEGENERATE)
+                & (self.signal_final[kns] != DEGENERATE)
+            )
             E1 = ev[karr[:, None], np.where(bf >= 0, bf, 0)]
             E2 = ev[kns[:, None], np.where(bf[kns] >= 0, bf[kns], 0)]
             jump = np.abs(E1 - E2)
@@ -4099,7 +4260,7 @@ class MATERIAL:
         return walls
 
     def _cliff_seam_edges(self) -> list:
-        '''
+        """
         The sub-accept_E energy cliffs ``_slot_wall_edges`` cannot see. Every
         undirected same-slot adjacency where the slot SWITCHES raw band
         (``bf[k] != bf[kn]``) across an energy step larger than the LOCAL
@@ -4123,7 +4284,7 @@ class MATERIAL:
         ``(jump, k, kn, slot)`` sorted worst (largest jump) first -- the same
         shape ``_slot_wall_edges`` uses, so the wall-relocation core consumes it
         unchanged.
-        '''
+        """
         bf = self.bands_final
         ev = self.eigenvalues
         neigh = np.asarray(self.neighbors)
@@ -4139,11 +4300,16 @@ class MATERIAL:
             b1 = np.where(bf >= 0, bf, 0)
             b2v = bf[kns]
             b2 = np.where(b2v >= 0, b2v, 0)
-            comp = (ok & (karr < kns))[:, None] & (bf >= 0) & (b2v >= 0) \
-                   & (bf != b2v) \
-                   & (self.signal_final != DEGENERATE) \
-                   & (self.signal_final[kns] != DEGENERATE) \
-                   & ~close[karr[:, None], b1] & ~close[kns[:, None], b2]
+            comp = (
+                (ok & (karr < kns))[:, None]
+                & (bf >= 0)
+                & (b2v >= 0)
+                & (bf != b2v)
+                & (self.signal_final != DEGENERATE)
+                & (self.signal_final[kns] != DEGENERATE)
+                & ~close[karr[:, None], b1]
+                & ~close[kns[:, None], b2]
+            )
             E1 = ev[karr[:, None], b1]
             E2 = ev[kns[:, None], b2]
             jump = np.abs(E1 - E2)
@@ -4154,7 +4320,7 @@ class MATERIAL:
         return cliffs
 
     def _dp_refuted_seam_edges(self) -> list:
-        '''
+        """
         Every undirected same-slot adjacency where the slot switches raw band
         AGAINST the wavefunction evidence: the state held at one endpoint has a
         CERTAIN successor (dp >= DP_CERTAIN, unique by normalization -- see
@@ -4166,7 +4332,7 @@ class MATERIAL:
         ``(dp_assigned, k, kn, slot)`` sorted worst (lowest dp) first.
         Degenerate-signalled endpoints and near-degenerate cells are excluded
         (their label is gauge -- basisrotation territory).
-        '''
+        """
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
         nks, nslots = bf.shape
@@ -4182,11 +4348,17 @@ class MATERIAL:
             b1 = np.where(bf >= 0, bf, 0)
             b2v = bf[kns]
             b2 = np.where(b2v >= 0, b2v, 0)
-            comp = ok[:, None] & (bf >= 0) & (b2v >= 0) & (bf != b2v) \
-                   & (self.signal_final != DEGENERATE) \
-                   & (self.signal_final[kns] != DEGENERATE) \
-                   & ~close[karr[:, None], b1] & ~close[kns[:, None], b2]
-            succ = cert[:, d, :][karr[:, None], b1]     # certain successor of the held state
+            comp = (
+                ok[:, None]
+                & (bf >= 0)
+                & (b2v >= 0)
+                & (bf != b2v)
+                & (self.signal_final != DEGENERATE)
+                & (self.signal_final[kns] != DEGENERATE)
+                & ~close[karr[:, None], b1]
+                & ~close[kns[:, None], b2]
+            )
+            succ = cert[:, d, :][karr[:, None], b1]  # certain successor of the held state
             comp &= (succ >= 0) & (succ != b2v)
             dpv = self.connections[karr[:, None], d, b1, b2]
             for k, s in zip(*np.where(comp)):
@@ -4200,7 +4372,7 @@ class MATERIAL:
         return out
 
     def dp_interp_mask(self) -> np.ndarray:
-        '''
+        """
         ``(nks, nslots)`` boolean mask of the k-points the Berry-geometry pass
         should interpolate over: the endpoints of every dp-broken seam edge
         (``_dp_refuted_seam_edges`` -- the report's dpBrk column) on a band that
@@ -4217,15 +4389,14 @@ class MATERIAL:
         genuine energy break (NOT_SOLVED / MISTAKE) in ``correct_signalfinal``.
         Cliff edges and the loose |dp|<tau scan are deliberately NOT included:
         only the signalled dp-broken seams, no more.
-        '''
+        """
         nks, nslots = self.bands_final.shape
-        grade = getattr(self, 'band_grade', None)
+        grade = getattr(self, "band_grade", None)
         if grade is not None:
-            fail = {s for s in range(nslots) if s < len(grade) and grade[s] == 'FAIL'}
+            fail = {s for s in range(nslots) if s < len(grade) and grade[s] == "FAIL"}
         else:
             csf = self.correct_signalfinal
-            fail = {s for s in range(nslots)
-                    if bool(np.any((csf[:, s] == NOT_SOLVED) | (csf[:, s] == MISTAKE)))}
+            fail = {s for s in range(nslots) if bool(np.any((csf[:, s] == NOT_SOLVED) | (csf[:, s] == MISTAKE)))}
         mask = np.zeros((nks, nslots), bool)
         for _dp, k, kn, s in self._dp_refuted_seam_edges():
             if s in fail:
@@ -4235,7 +4406,7 @@ class MATERIAL:
         return mask
 
     def _degenerate_seam_edges(self) -> list:
-        '''
+        """
         The near-degenerate counterpart of ``_dp_refuted_seam_edges``: every
         undirected same-slot adjacency where the slot switches raw band against
         a FLOOD-CERTAIN successor (dp >= ``DP_FLOOD_SUPPORT``, unique by Bessel)
@@ -4252,7 +4423,7 @@ class MATERIAL:
         no 0.8 partner (dp ~ 0.7 each) and produces no seed -- it is left to
         basisrotation, untouched. Returned as ``(dp_assigned, k, kn, slot)``
         sorted worst (lowest dp) first, the same shape tier 1/2 seeds use.
-        '''
+        """
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
         nks, nslots = bf.shape
@@ -4268,11 +4439,14 @@ class MATERIAL:
             b1 = np.where(bf >= 0, bf, 0)
             b2v = bf[kns]
             b2 = np.where(b2v >= 0, b2v, 0)
-            near = (close[karr[:, None], b1] | close[kns[:, None], b2]
-                    | (self.signal_final == DEGENERATE)
-                    | (self.signal_final[kns] == DEGENERATE))
+            near = (
+                close[karr[:, None], b1]
+                | close[kns[:, None], b2]
+                | (self.signal_final == DEGENERATE)
+                | (self.signal_final[kns] == DEGENERATE)
+            )
             comp = ok[:, None] & (bf >= 0) & (b2v >= 0) & (bf != b2v) & near
-            succ = cert[:, d, :][karr[:, None], b1]     # flood successor (0.8) of the held state
+            succ = cert[:, d, :][karr[:, None], b1]  # flood successor (0.8) of the held state
             comp &= (succ >= 0) & (succ != b2v)
             dpv = self.connections[karr[:, None], d, b1, b2]
             for k, s in zip(*np.where(comp)):
@@ -4286,20 +4460,26 @@ class MATERIAL:
         return out
 
     def _log_refuted_census(self, tag: str) -> int:
-        '''
+        """
         Log the global strict refuted-edge census (len of _dp_refuted_seam_edges)
         so consecutive runs are comparable pass-by-pass without an external
         audit script. The 0.9 partner map is cached.
-        '''
+        """
         n = len(self._dp_refuted_seam_edges())
-        self.logger.info(f'{BODY_INDENT}dp-refuted census [{tag}]: {n} edge(s)')
+        self.logger.info(f"{BODY_INDENT}dp-refuted census [{tag}]: {n} edge(s)")
         return n
 
-    def _exchange_region_counts(self, R: set, s: int, t: int, swapped: bool,
-                                cert_acc: np.ndarray,
-                                ignore_close: bool = False,
-                                wall_gate: np.ndarray = None) -> Tuple[int, int, int]:
-        '''
+    def _exchange_region_counts(
+        self,
+        R: set,
+        s: int,
+        t: int,
+        swapped: bool,
+        cert_acc: np.ndarray,
+        ignore_close: bool = False,
+        wall_gate: np.ndarray = None,
+    ) -> tuple[int, int, int]:
+        """
         (gross-jump walls, split ``cert_acc`` links, strict refuted edges) over
         every edge touching region ``R`` for slots s and t, in the current
         (``swapped=False``) or the exchanged (``swapped=True``) configuration.
@@ -4324,7 +4504,7 @@ class MATERIAL:
         raw-band SWITCH edge whose step exceeds the LOCAL gate ``min`` of the two
         endpoints -- the sub-accept_E cliffs; same-band steps (however steep) are
         never counted, so a legitimate steep dispersion cannot block a repair.
-        '''
+        """
         bf = self.bands_final
         ev = self.eigenvalues
         neigh = np.asarray(self.neighbors)
@@ -4340,7 +4520,7 @@ class MATERIAL:
                     continue
                 in2 = k2 in R
                 for slot, other in ((s, t), (t, s)):
-                    src1 = other if swapped else slot            # column the content
+                    src1 = other if swapped else slot  # column the content
                     src2 = other if (swapped and in2) else slot  # is read from
                     b1 = int(bf[k1, src1])
                     b2 = int(bf[k2, src2])
@@ -4348,26 +4528,28 @@ class MATERIAL:
                         continue
                     if wall_gate is None:
                         if abs(ev[k1, b1] - ev[k2, b2]) > self.accept_E:
-                            n_wall += 1                       # gross wall (flat accept_E)
-                    elif b1 != b2 and abs(ev[k1, b1] - ev[k2, b2]) > min(
-                            wall_gate[k1, b1], wall_gate[k2, b2]):
-                        n_wall += 1                           # local cliff (switch only)
+                            n_wall += 1  # gross wall (flat accept_E)
+                    elif b1 != b2 and abs(ev[k1, b1] - ev[k2, b2]) > min(wall_gate[k1, b1], wall_gate[k2, b2]):
+                        n_wall += 1  # local cliff (switch only)
                     p = int(cert_acc[k1, d, b1])
                     cl_cert = False if ignore_close else (close[k1, b1] or close[k2, b2])
                     if p >= 0 and p != b2 and not cl_cert:
                         n_cert += 1
-                    if (b1 != b2
-                            and self.signal_final[k1, src1] != DEGENERATE
-                            and self.signal_final[k2, src2] != DEGENERATE
-                            and not (close[k1, b1] or close[k2, b2])
-                            and int(cert[k1, d, b1]) >= 0
-                            and int(cert[k1, d, b1]) != b2):
+                    if (
+                        b1 != b2
+                        and self.signal_final[k1, src1] != DEGENERATE
+                        and self.signal_final[k2, src2] != DEGENERATE
+                        and not (close[k1, b1] or close[k2, b2])
+                        and int(cert[k1, d, b1]) >= 0
+                        and int(cert[k1, d, b1]) != b2
+                    ):
                         ref_keys.add((min(k1, k2), max(k1, k2), slot))
         return n_wall, n_cert, len(ref_keys)
 
-    def _seam_partner_candidates(self, anchor: int, start: int, s: int,
-                                 use_dp: bool, dp_tol: float = DP_CERTAIN) -> list:
-        '''
+    def _seam_partner_candidates(
+        self, anchor: int, start: int, s: int, use_dp: bool, dp_tol: float = DP_CERTAIN
+    ) -> list:
+        """
         Partner slots ``t`` for exchanging slot ``s`` content at the seam cell
         ``start``, as ``[(energy_mismatch, t), ...]`` best first: the (at most
         two) energy-matched slots within accept_E of the anchored state's
@@ -4377,7 +4559,7 @@ class MATERIAL:
         subject to the accept_E veto). The degen-patch pass passes
         ``dp_tol=DP_FLOOD_SUPPORT`` so a sub-certain-but-clear (0.8) successor
         still names the target slot.
-        '''
+        """
         bf = self.bands_final
         ev = self.eigenvalues
         nslots = bf.shape[1]
@@ -4385,9 +4567,9 @@ class MATERIAL:
         if ba < 0:
             return []
         Ea = float(ev[anchor, ba])
-        cands = sorted((abs(float(ev[start, bf[start, t]]) - Ea), t)
-                       for t in range(nslots)
-                       if t != s and bf[start, t] >= 0)
+        cands = sorted(
+            (abs(float(ev[start, bf[start, t]]) - Ea), t) for t in range(nslots) if t != s and bf[start, t] >= 0
+        )
         cands = [c for c in cands[:2] if c[0] <= self.accept_E]
         if use_dp:
             d_as = self._dir_index().get((anchor, start), -1)
@@ -4402,26 +4584,26 @@ class MATERIAL:
         return cands
 
     def _apply_slot_exchange(self, R: set, s: int, t: int) -> list:
-        '''
+        """
         Exchange slots s and t over every k-point of ``R`` on the final canvas
         (bands, both signals, and the forced/repaired audit masks travel with
         the content -- the per-row exchange preserves the bijection by
         construction). Returns the changed (k, slot) cells for re-grading.
-        '''
+        """
         bf = self.bands_final
         changed = []
         for kk in sorted(R):
             for arr in (bf, self.signal_final, self.correct_signalfinal):
                 arr[kk, s], arr[kk, t] = arr[kk, t], arr[kk, s]
-            for name in ('forced_mask', 'repaired_mask'):
+            for name in ("forced_mask", "repaired_mask"):
                 m = getattr(self, name, None)
-                if m is not None:                    # audit travels with the content
+                if m is not None:  # audit travels with the content
                     m[kk, s], m[kk, t] = m[kk, t], m[kk, s]
             changed.extend(((kk, s), (kk, t)))
         return changed
 
     def _apply_slot_rotation(self, R: set, order: tuple) -> list:
-        '''
+        """
         Rotate slots along ``order`` = (c0, c1, ..., c_{L-1}) over every
         k-point of ``R`` on the final canvas: each slot takes the content of
         the NEXT slot in ``order`` (``new[c_i] = old[c_{i+1 mod L}]``), so a
@@ -4430,28 +4612,29 @@ class MATERIAL:
         audit masks travel together; the per-row cyclic permutation preserves
         the bijection by construction. A length-2 ``order`` is exactly
         ``_apply_slot_exchange``. Returns the changed (k, slot) cells.
-        '''
+        """
         bf = self.bands_final
         L = len(order)
         arrays = [bf, self.signal_final, self.correct_signalfinal]
-        arrays += [m for m in (getattr(self, 'forced_mask', None),
-                               getattr(self, 'repaired_mask', None)) if m is not None]
+        arrays += [
+            m for m in (getattr(self, "forced_mask", None), getattr(self, "repaired_mask", None)) if m is not None
+        ]
         changed = []
         for kk in sorted(R):
             for arr in arrays:
-                vals = [arr[kk, c] for c in order]           # snapshot before writing
+                vals = [arr[kk, c] for c in order]  # snapshot before writing
                 for i, c in enumerate(order):
                     arr[kk, c] = vals[(i + 1) % L]
             changed.extend((kk, c) for c in order)
         return changed
 
     def _regrade_cells(self, changed_cells: list) -> None:
-        '''
+        """
         Re-grade on the final canvas: both signals of the exchanged cells and
         the energy-continuity signal of their same-slot neighbours. The audit
         masks moved with the content, so force-filled cells keep their FORCED
         marker wherever they landed.
-        '''
+        """
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
         changed_set = set(changed_cells)
@@ -4460,7 +4643,7 @@ class MATERIAL:
             for kn in neigh[k]:
                 if kn >= 0:
                     regrade.add((int(kn), s))
-        forced = getattr(self, 'forced_mask', None)
+        forced = getattr(self, "forced_mask", None)
         for k, s in sorted(regrade):
             if self.signal_final[k, s] == DEGENERATE:
                 continue
@@ -4475,8 +4658,7 @@ class MATERIAL:
                         if b2 < 0:
                             continue
                         values.append(self.connections[k, i_neig, b1, b2])
-                    self.signal_final[k, s] = min(evaluate_result(values) if values else NOT_SOLVED,
-                                                  POTENTIAL_CORRECT)
+                    self.signal_final[k, s] = min(evaluate_result(values) if values else NOT_SOLVED, POTENTIAL_CORRECT)
                     if forced is not None and forced[k, s]:
                         self.signal_final[k, s] = FORCED
                         self.correct_signalfinal[k, s] = FORCED_CONTINUITY
@@ -4486,14 +4668,23 @@ class MATERIAL:
             if int(bf[k, s]) < 0:
                 self.correct_signalfinal[k, s] = NOT_SOLVED
                 continue
-            sig, _ = evaluate_point(self.dimensions, k, s, self.kpoints_index,
-                                    self.matrix, bf, self.eigenvalues,
-                                    accept_E=self.accept_E, disp_scale=self.disp_scale,
-                                    local_gap=self.local_gap, band_disp=self.band_disp)
+            sig, _ = evaluate_point(
+                self.dimensions,
+                k,
+                s,
+                self.kpoints_index,
+                self.matrix,
+                bf,
+                self.eigenvalues,
+                accept_E=self.accept_E,
+                disp_scale=self.disp_scale,
+                local_gap=self.local_gap,
+                band_disp=self.band_disp,
+            )
             self.correct_signalfinal[k, s] = sig
 
     def _relocate_wall_patches(self, max_patches: int = 64) -> int:
-        '''
+        """
         Tier-1 patch relocation, seeded on the SILENT cliffs (gross energy
         jumps > accept_E between same-slot neighbours).
 
@@ -4515,11 +4706,11 @@ class MATERIAL:
 
         The exchange machinery is shared with the dp-seeded tier 2; see
         ``_relocate_patches`` for the flood and acceptance rules.
-        '''
-        return self._relocate_patches('walls', max_patches)
+        """
+        return self._relocate_patches("walls", max_patches)
 
     def _relocate_cliff_patches(self, max_patches: int = 64) -> int:
-        '''
+        """
         The tighter sibling of ``_relocate_wall_patches``: the SUB-accept_E
         cliffs. The same mid-sheet collision that produces a gross wall (see
         ``_relocate_wall_patches``) also lands on jumps that are large on the
@@ -4537,11 +4728,11 @@ class MATERIAL:
         Runs after tier 1 so the gross walls are already placed. A cliff no
         pairwise exchange can remove survives to ``_verify_no_cliffs`` and is
         graded honestly (CHECK/FAIL), never shipped as a silent USABLE band.
-        '''
-        return self._relocate_patches('cliff', max_patches)
+        """
+        return self._relocate_patches("cliff", max_patches)
 
     def _relocate_dp_seam_patches(self, max_patches: int = 64) -> int:
-        '''
+        """
         Tier-2 patch relocation, seeded on dp-REFUTED seams (split certain
         links, ``_dp_refuted_seam_edges``): mis-slotted patches whose energy
         step sits BELOW accept_E, so tier 1 never sees them, while the
@@ -4560,11 +4751,11 @@ class MATERIAL:
         Cannot undo tier 1: tier-1 exchanges land their seams on crossing
         corridors where dp is sub-certain, which produces no split certain
         links and is therefore never seeded here.
-        '''
-        return self._relocate_patches('dp', max_patches)
+        """
+        return self._relocate_patches("dp", max_patches)
 
     def _relocate_degenerate_patches(self, max_patches: int = 64) -> int:
-        '''
+        """
         Near-degenerate patch relocation, seeded on ``_degenerate_seam_edges``:
         the small patches that attached to the WRONG member of a near-degenerate
         band pair. Tiers 1/2 cannot see them -- the energy step hides below the
@@ -4584,11 +4775,11 @@ class MATERIAL:
         resolving the intra-subspace gauge is still basisrotation's job, now
         started from the right slot. Genuine 50/50 crossings have no 0.8 partner,
         produce no seed, and are left untouched.
-        '''
-        return self._relocate_patches('degen', max_patches)
+        """
+        return self._relocate_patches("degen", max_patches)
 
     def _relocate_patches(self, seed: str, max_patches: int = 64) -> int:
-        '''
+        """
         Shared patch-relocation core: exchange whole mis-slotted patches
         between two slots, relocating the label seam onto the crossing corridor
         where it belongs.
@@ -4643,7 +4834,7 @@ class MATERIAL:
         the two-sided defects unanimity cannot arbitrate, and removing them
         turns their seam cells into trusted anchors for the remaining passes.
         Returns the number of exchanged cells.
-        '''
+        """
         bf = self.bands_final
         ev = self.eigenvalues
         conn = self.connections
@@ -4654,19 +4845,25 @@ class MATERIAL:
         # dp acceptance counts split links against the looser support map:
         # a patch may not zero its certain links by relocating the damage
         # into merely sub-certain (0.8-0.9) seams the 0.9 map cannot see.
-        cert_acc = cert if seed in ('walls', 'cliff') else self._certain_partner_map(DP_FLOOD_SUPPORT)
-        is_degen = seed == 'degen'
-        is_cliff = seed == 'cliff'
+        cert_acc = cert if seed in ("walls", "cliff") else self._certain_partner_map(DP_FLOOD_SUPPORT)
+        is_degen = seed == "degen"
+        is_cliff = seed == "cliff"
         # the cliff pass counts walls at the per-(k, band) local continuity gate
         # over raw-band SWITCH edges only; every other seed keeps the flat accept_E.
         wall_gate = self.continuity_gate if is_cliff else None
         max_patch_cells = nks // 3
-        label = {'walls': 'Wall-patch relocation', 'dp': 'dp-seam relocation',
-                 'degen': 'degenerate-patch relocation',
-                 'cliff': 'cliff-patch relocation'}[seed]
-        unit = {'walls': 'wall edge(s)', 'dp': 'dp-refuted seam edge(s)',
-                'degen': 'near-degenerate seam edge(s)',
-                'cliff': 'sub-gate cliff edge(s)'}[seed]
+        label = {
+            "walls": "Wall-patch relocation",
+            "dp": "dp-seam relocation",
+            "degen": "degenerate-patch relocation",
+            "cliff": "cliff-patch relocation",
+        }[seed]
+        unit = {
+            "walls": "wall edge(s)",
+            "dp": "dp-refuted seam edge(s)",
+            "degen": "near-degenerate seam edge(s)",
+            "cliff": "sub-gate cliff edge(s)",
+        }[seed]
 
         def grow(start: int, s: int, t: int) -> Union[set, None]:
             # Seam-cost flood: k2 joins iff moving the seam past it is strictly
@@ -4683,7 +4880,7 @@ class MATERIAL:
                     bs2, bt2 = int(bf[k2, s]), int(bf[k2, t])
                     if bs2 < 0 or bt2 < 0 or bs1 < 0 or bt1 < 0:
                         continue
-                    if seed in ('walls', 'cliff'):
+                    if seed in ("walls", "cliff"):
                         keep = abs(ev[k1, bt1] - ev[k2, bs2]) + abs(ev[k1, bs1] - ev[k2, bt2])
                         swap = abs(ev[k1, bt1] - ev[k2, bt2]) + abs(ev[k1, bs1] - ev[k2, bs2])
                     else:
@@ -4705,13 +4902,15 @@ class MATERIAL:
                         R.add(k2)
                         queue.append(k2)
                         if len(R) > max_patch_cells:
-                            return None                  # runaway: not a patch
+                            return None  # runaway: not a patch
             return R
 
-        seed_edges = {'walls': self._slot_wall_edges,
-                      'dp': self._dp_refuted_seam_edges,
-                      'degen': self._degenerate_seam_edges,
-                      'cliff': self._cliff_seam_edges}[seed]
+        seed_edges = {
+            "walls": self._slot_wall_edges,
+            "dp": self._dp_refuted_seam_edges,
+            "degen": self._degenerate_seam_edges,
+            "cliff": self._cliff_seam_edges,
+        }[seed]
 
         changed_cells: list = []
         n_patch = 0
@@ -4727,8 +4926,12 @@ class MATERIAL:
             for metric, k, kn, s in worst:
                 for anchor, start in ((k, kn), (kn, k)):
                     for dmatch, t in self._seam_partner_candidates(
-                            anchor, start, s, use_dp=(seed not in ('walls', 'cliff')),
-                            dp_tol=(DP_FLOOD_SUPPORT if is_degen else DP_CERTAIN)):
+                        anchor,
+                        start,
+                        s,
+                        use_dp=(seed not in ("walls", "cliff")),
+                        dp_tol=(DP_FLOOD_SUPPORT if is_degen else DP_CERTAIN),
+                    ):
                         key = (start, s, t)
                         if key in tried:
                             continue
@@ -4736,13 +4939,13 @@ class MATERIAL:
                         R = grow(start, s, t)
                         if R is None:
                             continue
-                        w0, c0, r0 = self._exchange_region_counts(R, s, t, False, cert_acc,
-                                                                  ignore_close=is_degen,
-                                                                  wall_gate=wall_gate)
-                        w1, c1, r1 = self._exchange_region_counts(R, s, t, True, cert_acc,
-                                                                  ignore_close=is_degen,
-                                                                  wall_gate=wall_gate)
-                        if seed in ('walls', 'cliff'):
+                        w0, c0, r0 = self._exchange_region_counts(
+                            R, s, t, False, cert_acc, ignore_close=is_degen, wall_gate=wall_gate
+                        )
+                        w1, c1, r1 = self._exchange_region_counts(
+                            R, s, t, True, cert_acc, ignore_close=is_degen, wall_gate=wall_gate
+                        )
+                        if seed in ("walls", "cliff"):
                             ok_acc = w1 < w0 and 2 * w1 <= w0 and c1 <= c0 and r1 <= r0
                         else:
                             ok_acc = c1 < c0 and 2 * c1 <= c0 and w1 <= w0
@@ -4760,23 +4963,26 @@ class MATERIAL:
             R, s, t, w0, w1, c0, c1, r0, r1 = accepted
             changed_cells.extend(self._apply_slot_exchange(R, s, t))
             n_patch += 1
-            self.logger.info(f'{BODY_INDENT}{label}: slots ({s},{t}) '
-                             f'exchanged over {len(R)} k-point(s) -- walls {w0}->{w1}, '
-                             f'split certain links {c0}->{c1}, refuted {r0}->{r1}')
+            self.logger.info(
+                f"{BODY_INDENT}{label}: slots ({s},{t}) "
+                f"exchanged over {len(R)} k-point(s) -- walls {w0}->{w1}, "
+                f"split certain links {c0}->{c1}, refuted {r0}->{r1}"
+            )
 
         if not changed_cells:
-            self.logger.info(f'{BODY_INDENT}{label}: no exchangeable patch '
-                             f'({edges0 or 0} {unit} on the final canvas)')
+            self.logger.info(f"{BODY_INDENT}{label}: no exchangeable patch ({edges0 or 0} {unit} on the final canvas)")
             return 0
-        self.logger.info(f'{BODY_INDENT}{label}: {n_patch} patch(es), '
-                         f'{len(changed_cells)} cell(s) exchanged; {unit} '
-                         f'{edges0} -> {len(seed_edges())}')
+        self.logger.info(
+            f"{BODY_INDENT}{label}: {n_patch} patch(es), "
+            f"{len(changed_cells)} cell(s) exchanged; {unit} "
+            f"{edges0} -> {len(seed_edges())}"
+        )
 
         self._regrade_cells(changed_cells)
         return len(changed_cells)
 
     def _pattern_region(self, start: int, s: int, t: int) -> set:
-        '''
+        """
         The k-connected region around ``start`` where slots s and t hold the
         same raw-band pair as at ``start`` -- the pattern constraint of the
         greedy dp flood without its cost rule (the min-cut supplies the
@@ -4784,7 +4990,7 @@ class MATERIAL:
         any crossing involving either slot's sheet flips the pattern. No
         runaway cap is needed -- the min-cut may legally swap any subset (the
         seed is pinned, so never none).
-        '''
+        """
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
         pat = (int(bf[start, s]), int(bf[start, t]))
@@ -4804,7 +5010,7 @@ class MATERIAL:
         return R
 
     def _pattern_region_cycle(self, start: int, slots: tuple) -> set:
-        '''
+        """
         ``_pattern_region`` generalized to a set of ``slots``: the k-connected
         region around ``start`` where EVERY slot in ``slots`` holds the same
         raw band as at ``start`` (the cyclic pattern). Sheet-coherent by the
@@ -4813,7 +5019,7 @@ class MATERIAL:
         by ``_repair_dp_cycles`` to size the atomic rotation of a permutation
         cycle. Capped at ``nks // 3`` (a rotation over a third of the BZ is not
         a patch); returns the empty set on runaway or an unattributed pattern.
-        '''
+        """
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
         pat = tuple(int(bf[start, s]) for s in slots)
@@ -4832,11 +5038,11 @@ class MATERIAL:
                     R.add(k2)
                     queue.append(k2)
                     if len(R) > cap:
-                        return set()                 # runaway: not a patch
+                        return set()  # runaway: not a patch
         return R
 
     def _mincut_labeling(self, start: int, s: int, t: int) -> Union[set, None]:
-        '''
+        """
         Exact binary seam placement for the (s, t) pattern region around
         ``start``: one keep/swap variable per k-point, solved as an s-t min-cut
         (scipy maximum_flow). Pairwise capacities are the seam-laying cost
@@ -4849,9 +5055,9 @@ class MATERIAL:
         (the physical branch cuts), pays the dp-certainty weight where it
         splits a certain link, and is impossible (INF) across a gross energy
         jump. Returns the swap set, or None when no finite seam exists.
-        '''
+        """
         SCALE = 1000
-        INF_CAP = 2 ** 29
+        INF_CAP = 2**29
         bf = self.bands_final
         ev = self.eigenvalues
         conn = self.connections
@@ -4861,7 +5067,7 @@ class MATERIAL:
         close = self._near_degenerate_mask()
         cert = self._certain_partner_map()
         dir_idx = self._dir_index()
-        refusals = getattr(self, '_sheet_refusals', None) or set()
+        refusals = getattr(self, "_sheet_refusals", None) or set()
 
         B_s, B_t = int(bf[start, s]), int(bf[start, t])
         R = self._pattern_region(start, s, t)
@@ -4873,7 +5079,7 @@ class MATERIAL:
         def step_cost(k1: int, d: int, k2: int, b1: int, b2: int) -> float:
             # cost of the same-slot step b1@k1 -> b2@k2 along direction d
             if abs(ev[k1, b1] - ev[k2, b2]) > self.accept_E:
-                return np.inf                    # a step never crosses a gross jump
+                return np.inf  # a step never crosses a gross jump
             cost = 0.0
             p = int(cert[k1, d, b1])
             if p >= 0 and p != b2 and not (close[k1, b1] or close[k2, b2]):
@@ -4895,7 +5101,7 @@ class MATERIAL:
             if w > 0:
                 caps[(u, v)] = min(caps.get((u, v), 0) + w, INF_CAP)
             caps.setdefault((u, v), 0)
-            caps.setdefault((v, u), 0)           # reverse entry for the residual
+            caps.setdefault((v, u), 0)  # reverse entry for the residual
 
         n_clamped = 0
         # node 0 = source (keep side), node 1 = sink (swap side), cell i -> 2+i
@@ -4907,7 +5113,7 @@ class MATERIAL:
                     continue
                 if k2 in pos:
                     if k1 > k2:
-                        continue                 # one undirected capacity per pair,
+                        continue  # one undirected capacity per pair,
                     d21 = dir_idx.get((k2, k1))  # both directional costs summed
                     sides = [(k1, d, k2)] + ([(k2, d21, k1)] if d21 is not None else [])
                     g = c = 0.0
@@ -4933,14 +5139,14 @@ class MATERIAL:
                 else:
                     C_s, C_t = int(bf[k2, s]), int(bf[k2, t])
                     if C_s < 0 or C_t < 0:
-                        continue                 # matches _exchange_region_counts
+                        continue  # matches _exchange_region_counts
                     th_keep = step_cost(k1, d, k2, B_s, C_s) + step_cost(k1, d, k2, B_t, C_t)
                     th_swap = step_cost(k1, d, k2, B_t, C_s) + step_cost(k1, d, k2, B_s, C_t)
                     if not (np.isfinite(th_keep) or np.isfinite(th_swap)):
-                        return None              # conflicted border cell: no finite seam
-                    add_cap(u, 1, as_cap(th_keep))   # paid when the cell keeps
-                    add_cap(0, u, as_cap(th_swap))   # paid when the cell swaps
-        add_cap(2 + pos[start], 1, INF_CAP)      # pin the seed to swap
+                        return None  # conflicted border cell: no finite seam
+                    add_cap(u, 1, as_cap(th_keep))  # paid when the cell keeps
+                    add_cap(0, u, as_cap(th_swap))  # paid when the cell swaps
+        add_cap(2 + pos[start], 1, INF_CAP)  # pin the seed to swap
 
         n_nodes = len(Rl) + 2
         rows = np.fromiter((uv[0] for uv in caps), int, len(caps))
@@ -4949,7 +5155,7 @@ class MATERIAL:
         graph = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes), dtype=np.int32)
         res = maximum_flow(graph, 0, 1)
         if res.flow_value >= INF_CAP:
-            return None                          # no finite seam exists: refuse
+            return None  # no finite seam exists: refuse
         # keep side = nodes reachable from the source in the residual network
         residual = graph - res.flow
         seen = np.zeros(n_nodes, bool)
@@ -4965,12 +5171,13 @@ class MATERIAL:
                     queue.append(v)
         S = {k for k in Rl if not seen[2 + pos[k]]}
         if n_clamped:
-            self.logger.debug(f'{BODY_INDENT}min-cut ({s},{t}): {n_clamped} '
-                              f'non-submodular edge(s) clamped over {len(Rl)} cells')
+            self.logger.debug(
+                f"{BODY_INDENT}min-cut ({s},{t}): {n_clamped} non-submodular edge(s) clamped over {len(Rl)} cells"
+            )
         return S if S else None
 
     def _mincut_seam_relocate(self, max_moves: int = 64) -> int:
-        '''
+        """
         S2 of the dp-seam correction plan: place the label seam of each
         remaining refuted (s, t) pattern region at its exact optimum via s-t
         min-cut, iterating pairwise exchanges alpha-expansion-style over the
@@ -4983,7 +5190,7 @@ class MATERIAL:
         support-links not increasing, so the pass terminates: every accepted
         move decreases a non-negative integer. Braids no pairwise exchange
         improves are honest residue (sub-certain: basisrotation territory).
-        '''
+        """
         if not DP_SEAM_MINCUT:
             return 0
         bf = self.bands_final
@@ -5005,8 +5212,7 @@ class MATERIAL:
             tried = set()
             for metric, k, kn, s in seeds:
                 for anchor, start in ((k, kn), (kn, k)):
-                    for dmatch, t in self._seam_partner_candidates(
-                            anchor, start, s, use_dp=True):
+                    for dmatch, t in self._seam_partner_candidates(anchor, start, s, use_dp=True):
                         key = (int(bf[start, s]), int(bf[start, t]), s, t)
                         if key in tried:
                             continue
@@ -5021,10 +5227,12 @@ class MATERIAL:
                         self._regrade_cells(self._apply_slot_exchange(S, s, t))
                         moves += 1
                         total_cells += 2 * len(S)
-                        self.logger.info(f'{BODY_INDENT}min-cut seam placement: slots '
-                                         f'({s},{t}) exchanged over {len(S)} k-point(s) '
-                                         f'-- walls {w0}->{w1}, split links {c0}->{c1}, '
-                                         f'refuted {r0}->{r1}')
+                        self.logger.info(
+                            f"{BODY_INDENT}min-cut seam placement: slots "
+                            f"({s},{t}) exchanged over {len(S)} k-point(s) "
+                            f"-- walls {w0}->{w1}, split links {c0}->{c1}, "
+                            f"refuted {r0}->{r1}"
+                        )
                         accepted = True
                         break
                     if accepted:
@@ -5032,18 +5240,22 @@ class MATERIAL:
                 if accepted:
                     break
             if not accepted:
-                break                            # no pair improves: honest residue
+                break  # no pair improves: honest residue
         if moves:
-            self.logger.info(f'{BODY_INDENT}min-cut seam placement: {moves} move(s), '
-                             f'{total_cells} cell(s) exchanged; refuted seam edges '
-                             f'{edges0} -> {len(self._dp_refuted_seam_edges())}')
+            self.logger.info(
+                f"{BODY_INDENT}min-cut seam placement: {moves} move(s), "
+                f"{total_cells} cell(s) exchanged; refuted seam edges "
+                f"{edges0} -> {len(self._dp_refuted_seam_edges())}"
+            )
         else:
-            self.logger.info(f'{BODY_INDENT}min-cut seam placement: no improving move '
-                             f'({edges0 or 0} refuted seam edge(s) on the final canvas)')
+            self.logger.info(
+                f"{BODY_INDENT}min-cut seam placement: no improving move "
+                f"({edges0 or 0} refuted seam edge(s) on the final canvas)"
+            )
         return total_cells
 
     def _dp_cycle_at(self, k: int, kn: int) -> Union[tuple, None]:
-        '''
+        """
         Detect a k-local permutation CYCLE at ``kn`` mandated by the trusted
         neighbour ``k`` across the (k -> kn) edge, from the CERTAIN successor
         map (dp >= DP_CERTAIN). For each slot ``s`` whose k-content ``b_s`` has
@@ -5059,29 +5271,29 @@ class MATERIAL:
         containing the seed relation of the (k, kn) edge, or None when no such
         cycle exists here. A genuine crossing corridor has sub-certain dp / is
         near-degenerate, so it produces no certain cycle and is never returned.
-        '''
+        """
         bf = self.bands_final
         d = self._dir_index().get((k, kn), -1)
         if d < 0:
             return None
-        cert = self._certain_partner_map()               # DP_CERTAIN
+        cert = self._certain_partner_map()  # DP_CERTAIN
         close = self._near_degenerate_mask()
         nslots = bf.shape[1]
         # band held at kn -> its slot (unique; the row is a permutation)
         band_to_slot = {int(bf[kn, t]): t for t in range(nslots) if int(bf[kn, t]) >= 0}
-        src = {}                                          # slot s <- content of slot src[s]
+        src = {}  # slot s <- content of slot src[s]
         for s in range(nslots):
             b_s = int(bf[k, s])
             if b_s < 0 or self.signal_final[k, s] == DEGENERATE:
                 continue
-            p_s = int(cert[k, d, b_s])                    # certain successor toward kn
+            p_s = int(cert[k, d, b_s])  # certain successor toward kn
             if p_s < 0 or p_s == int(bf[kn, s]):
-                continue                                  # no mandate, or already satisfied
+                continue  # no mandate, or already satisfied
             t = band_to_slot.get(p_s, -1)
             if t < 0 or t == s:
                 continue
             if close[k, b_s] or close[kn, p_s] or self.signal_final[kn, t] == DEGENERATE:
-                continue                                  # gauge territory: hands off
+                continue  # gauge territory: hands off
             src[s] = t
         if not src:
             return None
@@ -5101,7 +5313,7 @@ class MATERIAL:
         return None
 
     def _repair_dp_cycles(self, max_rounds: int = 32) -> int:
-        '''
+        """
         Post-loop repair of the energy-QUIET permutation cycles the pairwise
         correctors cannot unwind and ``_repair_certain_links`` never sees.
 
@@ -5134,7 +5346,7 @@ class MATERIAL:
         before ``_repair_certain_links``. Bijection preserved by the per-row
         rotation; changed cells are re-graded on the final canvas. Returns the
         number of exchanged cells.
-        '''
+        """
         n_ref0 = len(self._dp_refuted_seam_edges())
         if n_ref0 == 0:
             return 0
@@ -5163,20 +5375,20 @@ class MATERIAL:
                     # trial-apply, measure exact global census, revert if worse.
                     # Snapshot every array _apply_slot_rotation touches (bands,
                     # both signals, and the audit masks) for the cycle's slots.
-                    arrays = [self.bands_final, self.signal_final,
-                              self.correct_signalfinal]
-                    arrays += [m for m in (getattr(self, 'forced_mask', None),
-                                           getattr(self, 'repaired_mask', None))
-                               if m is not None]
-                    snap = [(arr, {s: arr[:, s].copy() for s in order})
-                            for arr in arrays]
+                    arrays = [self.bands_final, self.signal_final, self.correct_signalfinal]
+                    arrays += [
+                        m
+                        for m in (getattr(self, "forced_mask", None), getattr(self, "repaired_mask", None))
+                        if m is not None
+                    ]
+                    snap = [(arr, {s: arr[:, s].copy() for s in order}) for arr in arrays]
                     cells = self._apply_slot_rotation(R, order)
                     ref1 = len(self._dp_refuted_seam_edges())
                     wall1 = len(self._slot_wall_edges())
                     if ref1 < ref0 and wall1 <= wall0:
                         accepted = (R, order, cells, ref0, ref1, wall0, wall1)
                         break
-                    for arr, cols in snap:                      # revert every array
+                    for arr, cols in snap:  # revert every array
                         for s, col in cols.items():
                             arr[:, s] = col
                 if accepted:
@@ -5187,21 +5399,27 @@ class MATERIAL:
             self._regrade_cells(cells)
             changed_cells.extend(cells)
             n_cyc += 1
-            self.logger.info(f'{BODY_INDENT}dp-cycle repair: slots {order} rotated over '
-                             f'{len(R)} k-point(s) -- refuted {ref0v}->{ref1v}, '
-                             f'walls {wall0v}->{wall1v}')
+            self.logger.info(
+                f"{BODY_INDENT}dp-cycle repair: slots {order} rotated over "
+                f"{len(R)} k-point(s) -- refuted {ref0v}->{ref1v}, "
+                f"walls {wall0v}->{wall1v}"
+            )
         if not changed_cells:
-            self.logger.info(f'{BODY_INDENT}dp-cycle repair: no improving rotation '
-                             f'({n_ref0} refuted seam edge(s) on the final canvas)')
+            self.logger.info(
+                f"{BODY_INDENT}dp-cycle repair: no improving rotation "
+                f"({n_ref0} refuted seam edge(s) on the final canvas)"
+            )
             return 0
         n_k = len(set(c[0] for c in changed_cells))
-        self.logger.info(f'{BODY_INDENT}dp-cycle repair: {n_cyc} cycle(s) rotated over '
-                         f'{n_k} k-point(s); refuted {n_ref0} -> '
-                         f'{len(self._dp_refuted_seam_edges())}')
+        self.logger.info(
+            f"{BODY_INDENT}dp-cycle repair: {n_cyc} cycle(s) rotated over "
+            f"{n_k} k-point(s); refuted {n_ref0} -> "
+            f"{len(self._dp_refuted_seam_edges())}"
+        )
         return len(changed_cells)
 
     def _repair_dp_swaps(self, max_rounds: int = 32) -> int:
-        '''
+        """
         Post-loop repair of the label swaps the energy machinery cannot see.
 
         A swapped pair of near-parallel bands (e.g. an SOC pair split by a few mRy)
@@ -5225,7 +5443,7 @@ class MATERIAL:
         what is actually shipped rather than on the state they were flagged in.
 
         Returns the number of swaps applied.
-        '''
+        """
         OTHER = 3
         bf = self.bands_final
         neigh = np.asarray(self.neighbors)
@@ -5256,7 +5474,7 @@ class MATERIAL:
                 k, s = int(k), int(s)
                 b_s = int(bf[k, s])
                 if b_s < 0 or n_supported(k, s, b_s) > 0:
-                    continue                            # already touched earlier this round
+                    continue  # already touched earlier this round
                 best_gain, best_t = 0, -1
                 for t in range(bf.shape[1]):
                     if t == s:
@@ -5264,7 +5482,7 @@ class MATERIAL:
                     b_t = int(bf[k, t])
                     if b_t < 0:
                         continue
-                    cur = n_supported(k, t, b_t)        # slot s contributes 0 (candidate)
+                    cur = n_supported(k, t, b_t)  # slot s contributes 0 (candidate)
                     new = n_supported(k, s, b_t) + n_supported(k, t, b_s)
                     if new - cur > best_gain:
                         best_gain, best_t = new - cur, t
@@ -5277,11 +5495,13 @@ class MATERIAL:
                 break
         if swaps:
             n_k = len(set(c[0] for c in swapped_cells))
-            self.logger.info(f'{BODY_INDENT}DP-evidence swap repair: exchanged {swaps} slot '
-                             f'pair(s) at {n_k} k-point(s)')
+            self.logger.info(
+                f"{BODY_INDENT}DP-evidence swap repair: exchanged {swaps} slot pair(s) at {n_k} k-point(s)"
+            )
             for k, s, t in swapped_cells:
-                self.logger.debug(f'{BODY_INDENT}  [dp-swap] k={k}: slot {s} <-> slot {t} '
-                                  f'(now bands {int(bf[k, s])}/{int(bf[k, t])})')
+                self.logger.debug(
+                    f"{BODY_INDENT}  [dp-swap] k={k}: slot {s} <-> slot {t} (now bands {int(bf[k, s])}/{int(bf[k, t])})"
+                )
 
         # Re-grade the failed cells (NOT/MIS/OTH) on the final canvas. DEGENERATE
         # keeps its marker and FORCED_CONTINUITY cells are not in the refresh set.
@@ -5292,22 +5512,33 @@ class MATERIAL:
             k, s = int(k), int(s)
             if self.signal_final[k, s] == DEGENERATE:
                 continue
-            sig, _ = evaluate_point(self.dimensions, k, s, self.kpoints_index,
-                                    self.matrix, bf, self.eigenvalues,
-                                    accept_E=self.accept_E, disp_scale=self.disp_scale,
-                                    local_gap=self.local_gap, band_disp=self.band_disp)
+            sig, _ = evaluate_point(
+                self.dimensions,
+                k,
+                s,
+                self.kpoints_index,
+                self.matrix,
+                bf,
+                self.eigenvalues,
+                accept_E=self.accept_E,
+                disp_scale=self.disp_scale,
+                local_gap=self.local_gap,
+                band_disp=self.band_disp,
+            )
             if sig != self.correct_signalfinal[k, s]:
                 if sig > self.correct_signalfinal[k, s]:
                     upgraded += 1
                 self.correct_signalfinal[k, s] = sig
                 refreshed += 1
         if refreshed:
-            self.logger.info(f'{BODY_INDENT}Failed-cell re-grade on the final canvas: '
-                             f'{refreshed} signal(s) changed ({upgraded} upgraded)')
+            self.logger.info(
+                f"{BODY_INDENT}Failed-cell re-grade on the final canvas: "
+                f"{refreshed} signal(s) changed ({upgraded} upgraded)"
+            )
         return swaps
 
     def _flag_dp_unsupported(self) -> int:
-        '''
+        """
         Final audit: demote to MISTAKE every attributed cell whose assignment has
         ZERO dp-supported directions and no degeneracy excuse.
 
@@ -5321,36 +5552,38 @@ class MATERIAL:
         is NOT modified -- this only makes the report honest about it.
 
         Returns the number of demoted cells.
-        '''
+        """
         OTHER = 3
-        CORRECT_C = 4                                               # energy-continuity scale
+        CORRECT_C = 4  # energy-continuity scale
         bf = self.bands_final
         sup, tot = self._dp_support_counts()
-        close = self._near_degenerate_mask()                        # (k, band) near-degenerate w/ a neighbour band
+        close = self._near_degenerate_mask()  # (k, band) near-degenerate w/ a neighbour band
         att = bf >= 0
         in_degen = np.zeros(bf.shape, bool)
         in_degen[att] = close[np.where(att)[0], bf[att]]
         csf = self.correct_signalfinal
-        target = (att & (tot > 0) & (sup == 0) & ~in_degen &
-                  ((csf == OTHER) | (csf == CORRECT_C)))
+        target = att & (tot > 0) & (sup == 0) & ~in_degen & ((csf == OTHER) | (csf == CORRECT_C))
         n = int(target.sum())
         if n:
-            per_band = {int(s): np.where(target[:, s])[0]
-                        for s in range(bf.shape[1]) if target[:, s].any()}
-            summary = ', '.join(f'band {s}: {len(ks)}' for s, ks in per_band.items())
-            self.logger.info(f'{BODY_INDENT}DP-support audit: {n} attributed point(s) have zero '
-                             f'dot-product support in their slot -- demoted to MISTAKE ({summary})')
+            per_band = {int(s): np.where(target[:, s])[0] for s in range(bf.shape[1]) if target[:, s].any()}
+            summary = ", ".join(f"band {s}: {len(ks)}" for s, ks in per_band.items())
+            self.logger.info(
+                f"{BODY_INDENT}DP-support audit: {n} attributed point(s) have zero "
+                f"dot-product support in their slot -- demoted to MISTAKE ({summary})"
+            )
             for s, ks in per_band.items():
-                self.logger.debug(f'{BODY_INDENT}  [dp-audit] band {s}: k = {list(ks[:50])}'
-                                  + (' ...' if len(ks) > 50 else ''))
+                self.logger.debug(
+                    f"{BODY_INDENT}  [dp-audit] band {s}: k = {list(ks[:50])}" + (" ..." if len(ks) > 50 else "")
+                )
             csf[target] = MISTAKE
         else:
-            self.logger.info(f'{BODY_INDENT}DP-support audit: every attributed point has '
-                             f'dot-product support (no silent swaps)')
+            self.logger.info(
+                f"{BODY_INDENT}DP-support audit: every attributed point has dot-product support (no silent swaps)"
+            )
         return n
 
     def _ensure_connectivity(self) -> None:
-        '''
+        """
         Connectivity guard (anti-shatter safety net). No node may be left as a degree-0
         singleton: thousands of isolated nodes would each become their own community and
         feed the O(samples^2) assignment loop in get_components (count = len(samples)**2)
@@ -5361,51 +5594,61 @@ class MATERIAL:
         One best-overlap edge per orphan is the most defensible link: it bounds the
         connected-component count by construction, cannot create dense cross-band merges,
         and is a weak link the validation can still override on the next pass.
-        '''
+        """
         isolated = [n for n in self.GRAPH.nodes if self.GRAPH.degree(n) == 0]
         if not isolated:
             return
         added = 0
         for node in isolated:
-            bn = node // self.nks                       # band slot of this node
+            bn = node // self.nks  # band slot of this node
             k1 = node % self.nks
             best_w = -2.0
             best_pn = None
             for i_neig, kn in enumerate(self.neighbors[k1]):
                 if kn == -1:
-                    continue                            # neighbour outside the BZ grid
-                conn = float(self.connections[k1, i_neig, bn, bn])      # <psi_{k,bn}|psi_{kn,bn}>
+                    continue  # neighbour outside the BZ grid
+                conn = float(self.connections[k1, i_neig, bn, bn])  # <psi_{k,bn}|psi_{kn,bn}>
                 w = 1 - 2 / np.pi * np.arccos(np.clip(conn, -1.0, 1.0))  # same metric as the edge build
                 if w > best_w:
                     best_w = w
                     best_pn = kn + bn * self.nks
             if best_pn is not None and best_pn != node:
                 if self.GRAPH.has_edge(node, best_pn):
-                    self.GRAPH[node][best_pn]['weight'] += 1
+                    self.GRAPH[node][best_pn]["weight"] += 1
                 else:
                     self.GRAPH.add_edge(node, best_pn, weight=max(best_w, 1e-6))
                 added += 1
-        self.logger.info(f'{BODY_INDENT}Connectivity guard: linked {added} orphan node(s) '
-                         f'of {len(isolated)} isolated to best-overlap neighbour')
+        self.logger.info(
+            f"{BODY_INDENT}Connectivity guard: linked {added} orphan node(s) "
+            f"of {len(isolated)} isolated to best-overlap neighbour"
+        )
 
     def report(self):
-        self.final_report += '*************************************************************************************************\n'
-        self.final_report += '|                                       SOLUTION REPORT                                         |\n'
-        self.final_report += '*************************************************************************************************\n\n'
+        self.final_report += (
+            "*************************************************************************************************\n"
+        )
+        self.final_report += (
+            "|                                       SOLUTION REPORT                                         |\n"
+        )
+        self.final_report += (
+            "*************************************************************************************************\n\n"
+        )
 
         # Per-band counts (validate scale: NOT, MIS, DEG, OTH, COR, FOR, Score)
         # are still needed for the usable/completed-band logic; we read them but
         # render a compact, actionable table instead of the full signal table.
-        _, report_a2 = self.print_report(self.correct_signalfinal, 'Final Report', show=False, header_text=VALIDATE_RESULT_HEADER)
+        _, report_a2 = self.print_report(
+            self.correct_signalfinal, "Final Report", show=False, header_text=VALIDATE_RESULT_HEADER
+        )
 
         ###########################################################################
         # Compact per-band table: only the actionable counts + a plain status.
         ###########################################################################
-        TOL_CLEAN = 0.97            # at/above this (and nothing flagged) -> CLEAN; below -> USABLE
-        DEGEN_GAP = 0.010           # Ry (~0.14 eV); a force-fill whose slot sits within this
-                                    # gap of an adjacent band is a degenerate-doublet
-                                    # relabeling (gauge), not a genuine mis-assignment
-        FORCED_FAIL_FRAC = 0.05     # > this fraction of suspect force-fills -> FAIL
+        TOL_CLEAN = 0.97  # at/above this (and nothing flagged) -> CLEAN; below -> USABLE
+        DEGEN_GAP = 0.010  # Ry (~0.14 eV); a force-fill whose slot sits within this
+        # gap of an adjacent band is a degenerate-doublet
+        # relabeling (gauge), not a genuine mis-assignment
+        FORCED_FAIL_FRAC = 0.05  # > this fraction of suspect force-fills -> FAIL
         bands_attention = []
 
         def _forced_split(i):
@@ -5465,8 +5708,7 @@ class MATERIAL:
                 if len(kn) == 0:
                     continue
                 bn_neighs = self.bands_final[kn, i]
-                dps = self.connections[np.repeat(k, len(kn)), i_neigs,
-                                       np.repeat(bk, len(kn)), bn_neighs]
+                dps = self.connections[np.repeat(k, len(kn)), i_neigs, np.repeat(bk, len(kn)), bn_neighs]
                 total += float(np.mean(dps))
                 count += 1
             return total / count if count else self.final_score[i]
@@ -5479,15 +5721,17 @@ class MATERIAL:
         # called USABLE on the strength of its Failed column alone.
         ###########################################################################
         _jumps = self._nn_energy_jump_map()
-        _silent_mask = ((self.bands_final >= 0) &
-                        (np.nan_to_num(_jumps, nan=0.0) > self.accept_E) &
-                        np.isin(self.correct_signalfinal, (3, 4)))          # OTHER, CORRECT
+        _silent_mask = (
+            (self.bands_final >= 0)
+            & (np.nan_to_num(_jumps, nan=0.0) > self.accept_E)
+            & np.isin(self.correct_signalfinal, (3, 4))
+        )  # OTHER, CORRECT
         silent_counts = _silent_mask.sum(axis=0)
         # Cliff column: per-slot count of surviving sub-accept_E cliff edges
         # (raw-band switches above the LOCAL continuity gate), populated by the
         # end-of-solve _verify_no_cliffs invariant. Fall back to a fresh census if
         # report() is called on a canvas that never ran the invariant.
-        cliff_counts = getattr(self, 'cliff_counts', None)
+        cliff_counts = getattr(self, "cliff_counts", None)
         if cliff_counts is None:
             cliff_counts = np.zeros(self.bands_final.shape[1], dtype=int)
             for _j, _k, _kn, _s in self._cliff_seam_edges():
@@ -5497,17 +5741,17 @@ class MATERIAL:
         # permutation cycles _repair_dp_cycles could not unwind), populated by
         # the end-of-solve _verify_no_dp_cycles invariant. Fall back to a fresh
         # census if report() is called on a canvas that never ran the invariant.
-        refuted_counts = getattr(self, 'refuted_counts', None)
+        refuted_counts = getattr(self, "refuted_counts", None)
         if refuted_counts is None:
             refuted_counts = np.zeros(self.bands_final.shape[1], dtype=int)
             for _v, _k, _kn, _s in self._dp_refuted_seam_edges():
                 refuted_counts[int(_s)] += 1
 
-        header_line = ' Band | Failed | Degen | Benign | Susp | Silent | Cliff | dpBrk | Score | Status'
-        table = f'\n{TITLE_INDENT}====== Final Report ======\n'
-        table += _format_legend(['Failed', 'Degen', 'Benign', 'Susp', 'Silent', 'Cliff', 'dpBreak', 'Score', 'Status'])
-        table += f'\n{BODY_INDENT}{header_line}'
-        table += f'\n{BODY_INDENT}' + '-' * len(header_line)
+        header_line = " Band | Failed | Degen | Benign | Susp | Silent | Cliff | dpBrk | Score | Status"
+        table = f"\n{TITLE_INDENT}====== Final Report ======\n"
+        table += _format_legend(["Failed", "Degen", "Benign", "Susp", "Silent", "Cliff", "dpBreak", "Score", "Status"])
+        table += f"\n{BODY_INDENT}{header_line}"
+        table += f"\n{BODY_INDENT}" + "-" * len(header_line)
         band_grade = []
         for i in range(self.nbnd):
             failed = int(report_a2[i, NOT_SOLVED] + report_a2[i, MISTAKE])
@@ -5540,22 +5784,24 @@ class MATERIAL:
             # (across a real gap) asks for verification; a benign force-fill is
             # gauge-level and does not affect usability.
             if failed > 0 or suspect + silent + cliff + dpbrk > FORCED_FAIL_FRAC * self.nks:
-                status = 'FAIL'
+                status = "FAIL"
             elif suspect > 0 or silent > 0 or cliff > 0 or dpbrk > 0:
-                status = 'CHECK'                # suspect fill / silent cliff / sub-gate cliff / dp break -> verify
+                status = "CHECK"  # suspect fill / silent cliff / sub-gate cliff / dp break -> verify
             elif degen > 0:
-                status = 'ROTATE'               # usable after basis rotation
+                status = "ROTATE"  # usable after basis rotation
             elif forced == 0 and score >= TOL_CLEAN:
-                status = 'CLEAN'                # pristine, nothing flagged
+                status = "CLEAN"  # pristine, nothing flagged
             else:
-                status = 'USABLE'               # nothing flagged (benign fills and/or score < clean)
+                status = "USABLE"  # nothing flagged (benign fills and/or score < clean)
             band_grade.append(status)
-            table += (f'\n{BODY_INDENT} {i+self.min_band:<4d} | {failed:^6d} | {degen:^5d} | '
-                      f'{benign:^6d} | {suspect:^4d} | {silent:^6d} | {cliff:^5d} | {dpbrk:^5d} | '
-                      f'{score:>5.2f} | {status}')
-            if status in ('FAIL', 'CHECK'):
+            table += (
+                f"\n{BODY_INDENT} {i + self.min_band:<4d} | {failed:^6d} | {degen:^5d} | "
+                f"{benign:^6d} | {suspect:^4d} | {silent:^6d} | {cliff:^5d} | {dpbrk:^5d} | "
+                f"{score:>5.2f} | {status}"
+            )
+            if status in ("FAIL", "CHECK"):
                 bands_attention.append((i, failed, degen, benign, suspect, silent, cliff, dpbrk, status))
-        table += '\n'
+        table += "\n"
         # Expose the per-band grade (indexed by slot) so downstream consumers --
         # e.g. dp_interp_mask(), which must drop FAIL bands -- can read it without
         # re-parsing the report string.
@@ -5566,27 +5812,27 @@ class MATERIAL:
         # The points that failed and why.
         ###########################################################################
         if bands_attention:
-            self.final_report += f'\n{BODY_INDENT}Bands needing attention:'
+            self.final_report += f"\n{BODY_INDENT}Bands needing attention:"
             for i, failed, degen, benign, suspect, silent, cliff, dpbrk, status in bands_attention:
                 reasons = []
                 if failed > 0:
-                    reasons.append(f'{failed} failed (energy discontinuity / low overlap)')
+                    reasons.append(f"{failed} failed (energy discontinuity / low overlap)")
                 if suspect > 0:
-                    reasons.append(f'{suspect} of {benign+suspect} force-fill(s) across a real energy gap')
+                    reasons.append(f"{suspect} of {benign + suspect} force-fill(s) across a real energy gap")
                 if silent > 0:
-                    reasons.append(f'{silent} silent cliff(s) (validated cells on a jump > accept_E)')
+                    reasons.append(f"{silent} silent cliff(s) (validated cells on a jump > accept_E)")
                 if cliff > 0:
-                    reasons.append(f'{cliff} sub-gate cliff edge(s) (raw-band switch above the local continuity gate)')
+                    reasons.append(f"{cliff} sub-gate cliff edge(s) (raw-band switch above the local continuity gate)")
                 if dpbrk > 0:
-                    reasons.append(f'{dpbrk} dp-broken seam edge(s) (raw-band switch against a certain dp link)')
-                reason = ' + '.join(reasons) if reasons else f'score {self.final_score[i]:.2f}'
-                verdict = 'NOT usable' if status == 'FAIL' else 'verify before use'
-                self.final_report += (f'\n{BODY_INDENT}  Band {i+self.min_band:>3d} : {reason} - {verdict}')
-            self.final_report += '\n'
+                    reasons.append(f"{dpbrk} dp-broken seam edge(s) (raw-band switch against a certain dp link)")
+                reason = " + ".join(reasons) if reasons else f"score {self.final_score[i]:.2f}"
+                verdict = "NOT usable" if status == "FAIL" else "verify before use"
+                self.final_report += f"\n{BODY_INDENT}  Band {i + self.min_band:>3d} : {reason} - {verdict}"
+            self.final_report += "\n"
 
         p_report, problems = self.solved_problems_info
 
-        self.final_report += '\n\t{:-^30}\n\t{: <30}\n\t{:-^30}\n'.format('', 'Summary:', '')
+        self.final_report += "\n\t{:-^30}\n\t{: <30}\n\t{:-^30}\n".format("", "Summary:", "")
         self.final_report += p_report
 
         point2k_bn = lambda p: (p % self.nks, p // self.nks)
@@ -5594,25 +5840,25 @@ class MATERIAL:
         for d1, d2 in problems:
             k1, bn1 = point2k_bn(d1)
             k2, bn2 = point2k_bn(d2)
-            Bk1 = self.bands_final[k1] == bn1                               # Find in which  band the k-point was attributed
-            Bk2 = self.bands_final[k2] == bn2                               # Find in which  band the k-point was attributed
-            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1               # Final band
-            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2               # Final band
-        
-            self.final_report += f'\n\t\t\tK-point: {k1} bands: {bn1+self.min_band}, {bn2+self.min_band}' # Report
-        
+            Bk1 = self.bands_final[k1] == bn1  # Find in which  band the k-point was attributed
+            Bk2 = self.bands_final[k2] == bn2  # Find in which  band the k-point was attributed
+            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1  # Final band
+            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2  # Final band
+
+            self.final_report += f"\n\t\t\tK-point: {k1} bands: {bn1 + self.min_band}, {bn2 + self.min_band}"  # Report
+
         if len(problems) > 0:
-            self.final_report += f'\n\t\t  These points were corrected.'
-        
+            self.final_report += "\n\t\t  These points were corrected."
+
         degenerates = []
 
         for i, (d1, d2) in enumerate(self.degenerates):
             k1, bn1 = point2k_bn(d1)
             k2, bn2 = point2k_bn(d2)
-            Bk1 = self.bands_final[k1] == bn1                               # Find in which  band the k-point was attributed
-            Bk2 = self.bands_final[k2] == bn2                               # Find in which  band the k-point was attributed
-            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1               # Final band
-            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2               # Final band
+            Bk1 = self.bands_final[k1] == bn1  # Find in which  band the k-point was attributed
+            Bk2 = self.bands_final[k2] == bn2  # Find in which  band the k-point was attributed
+            bn1 = np.argmax(Bk1) if np.sum(Bk1) != 0 else bn1  # Final band
+            bn2 = np.argmax(Bk2) if np.sum(Bk2) != 0 else bn2  # Final band
             bn1 = self.bands_final[k1, bn1]
             bn2 = self.bands_final[k2, bn2]
 
@@ -5621,106 +5867,128 @@ class MATERIAL:
 
         if len(degenerates) > 0:
             n = len(degenerates)
-            self.final_report += f'\n\n\t\tNumber of degenerate points: {n}\n'
+            self.final_report += f"\n\n\t\tNumber of degenerate points: {n}\n"
             for k1, bn1, bn2 in degenerates:
-                self.final_report += f'\n\t\t\t* K-point: {k1} Bands: {bn1+self.min_band}, {bn2+self.min_band}'
-            self.final_report += f'\n\n\t\t  ' + textwrap.fill(
-                'Degenerate points refer to instances where a point shares the same numerical energy value with another k-point, and the dot product with its neighboring points falls within the range of 0.5 to 0.8. \n\tAs a result, it is necessary for the rotation basis program to be executed for these points.',
-                width=110,
-                subsequent_indent='\t\t  '
-            ) + '\n'
+                self.final_report += f"\n\t\t\t* K-point: {k1} Bands: {bn1 + self.min_band}, {bn2 + self.min_band}"
+            self.final_report += (
+                "\n\n\t\t  "
+                + textwrap.fill(
+                    "Degenerate points refer to instances where a point shares the same numerical energy value with another k-point, and the dot product with its neighboring points falls within the range of 0.5 to 0.8. \n\tAs a result, it is necessary for the rotation basis program to be executed for these points.",
+                    width=110,
+                    subsequent_indent="\t\t  ",
+                )
+                + "\n"
+            )
 
         if len(self.degenerate_final) > 0:
             n = len(self.degenerate_final)
-            self.final_report += f'\n\n\t\t  Found {n} points with one or more neighbor with a dot-product between 0.5 and 0.8.'
-            self.final_report += f'\n\t\t  May not be degenerate points under energy criteria.'
-            self.final_report += f'\n\t\t  So they were not signaled and no corrections were applied.'
-            self.final_report += f'\n\t\t  However, they are saved in the degeneratefinal.npy file, in case they need analysis.'
+            self.final_report += (
+                f"\n\n\t\t  Found {n} points with one or more neighbor with a dot-product between 0.5 and 0.8."
+            )
+            self.final_report += "\n\t\t  May not be degenerate points under energy criteria."
+            self.final_report += "\n\t\t  So they were not signaled and no corrections were applied."
+            self.final_report += (
+                "\n\t\t  However, they are saved in the degeneratefinal.npy file, in case they need analysis."
+            )
             if self.logger.level == logging.DEBUG:
-                self.final_report += '\n\t\t   Points:'
+                self.final_report += "\n\t\t   Points:"
                 i_sort = np.argsort([k for k, _, _ in self.degenerate_final])
                 for k, bn1, bn2 in self.degenerate_final[i_sort]:
-                    self.final_report += f'\n\t\t  * K-point: {k} \tBands: {bn1+self.min_band}, {bn2+self.min_band}'
+                    self.final_report += f"\n\t\t  * K-point: {k} \tBands: {bn1 + self.min_band}, {bn2 + self.min_band}"
 
         # Bands grouped by usability. A force-fill inside a near-degenerate
         # doublet (USABLE/ROTATE) is a gauge-level relabeling: it does NOT make a
         # band unusable, nor does it hide the bands above it. Only a genuine
         # energy break (FAIL) breaks the contiguous run from the bottom.
-        usable = [i for i in range(self.nbnd) if band_grade[i] in ('CLEAN', 'USABLE', 'ROTATE')]
-        check  = [i for i in range(self.nbnd) if band_grade[i] == 'CHECK']
-        fail   = [i for i in range(self.nbnd) if band_grade[i] == 'FAIL']
+        usable = [i for i in range(self.nbnd) if band_grade[i] in ("CLEAN", "USABLE", "ROTATE")]
+        check = [i for i in range(self.nbnd) if band_grade[i] == "CHECK"]
+        fail = [i for i in range(self.nbnd) if band_grade[i] == "FAIL"]
 
         def _fmt_ranges(bands):
             if not bands:
-                return '(none)'
+                return "(none)"
             bands = sorted(bands)
             out, start, prev = [], bands[0], bands[0]
             for b in bands[1:]:
                 if b == prev + 1:
                     prev = b
                     continue
-                out.append(f'{start+self.min_band}-{prev+self.min_band}' if prev > start
-                           else f'{start+self.min_band}')
+                out.append(
+                    f"{start + self.min_band}-{prev + self.min_band}" if prev > start else f"{start + self.min_band}"
+                )
                 start = prev = b
-            out.append(f'{start+self.min_band}-{prev+self.min_band}' if prev > start
-                       else f'{start+self.min_band}')
-            return ', '.join(out)
+            out.append(
+                f"{start + self.min_band}-{prev + self.min_band}" if prev > start else f"{start + self.min_band}"
+            )
+            return ", ".join(out)
 
         self.completed_bands = np.array(usable, dtype=int)
 
         # Contiguous run of usable bands from the bottom; broken only by a FAIL.
         max_solved = 0
         for i in range(self.nbnd):
-            if band_grade[i] == 'FAIL':
+            if band_grade[i] == "FAIL":
                 break
             max_solved += 1
         self.max_solved = max_solved
 
-        self.final_report += f'\n\n\n\tUsable bands: {_fmt_ranges(usable)}'
-        self.final_report += (f'\n\t\t  {len(usable)} band(s) free of genuine errors '
-                              f'(saved in `completed_bands.npy`).')
-        self.final_report += (f'\n\t\t  Force-fills inside degenerate doublets are gauge-level relabelings; '
-                              f'they are\n\t\t  reported in the table but do not affect usability.')
+        self.final_report += f"\n\n\n\tUsable bands: {_fmt_ranges(usable)}"
+        self.final_report += f"\n\t\t  {len(usable)} band(s) free of genuine errors (saved in `completed_bands.npy`)."
+        self.final_report += (
+            "\n\t\t  Force-fills inside degenerate doublets are gauge-level relabelings; "
+            "they are\n\t\t  reported in the table but do not affect usability."
+        )
         if check:
-            self.final_report += f'\n\n\tNeeds verification (CHECK): {_fmt_ranges(check)}'
-            self.final_report += (f'\n\t\t  A force-fill across a real energy gap; '
-                                  f'usable only after a manual check.')
+            self.final_report += f"\n\n\tNeeds verification (CHECK): {_fmt_ranges(check)}"
+            self.final_report += "\n\t\t  A force-fill across a real energy gap; usable only after a manual check."
         if fail:
-            self.final_report += f'\n\n\tNot usable (FAIL): {_fmt_ranges(fail)}'
-            self.final_report += f'\n\t\t  Genuine energy discontinuity / low overlap.'
+            self.final_report += f"\n\n\tNot usable (FAIL): {_fmt_ranges(fail)}"
+            self.final_report += "\n\t\t  Genuine energy discontinuity / low overlap."
 
-        n_repaired = int(np.sum(self.repaired_mask)) if getattr(self, 'repaired_mask', None) is not None else 0
+        n_repaired = int(np.sum(self.repaired_mask)) if getattr(self, "repaired_mask", None) is not None else 0
         if n_repaired > 0:
-            self.final_report += f'\n\n\t{n_repaired} point(s) were reassigned by the a-posteriori energy-continuity repair'
-            self.final_report += f'\n\tpass (extrapolated from trusted neighbouring trajectories). They were re-validated'
-            self.final_report += f'\n\tby the energy-continuity criteria like any other point.'
+            self.final_report += (
+                f"\n\n\t{n_repaired} point(s) were reassigned by the a-posteriori energy-continuity repair"
+            )
+            self.final_report += (
+                "\n\tpass (extrapolated from trusted neighbouring trajectories). They were re-validated"
+            )
+            self.final_report += "\n\tby the energy-continuity criteria like any other point."
 
-        n_forced = int(np.sum(self.forced_mask)) if getattr(self, 'forced_mask', None) is not None else 0
+        n_forced = int(np.sum(self.forced_mask)) if getattr(self, "forced_mask", None) is not None else 0
         if n_forced > 0:
-            self.final_report += f'\n\n\t{n_forced} point(s) were force-filled (FOR) by the completeness pass to guarantee a'
-            self.final_report += f'\n\tband attribution everywhere. These are not genuine solves: they were assigned the'
-            self.final_report += f'\n\tclosest available band in energy. A force-fill that lands inside a near-degenerate'
-            self.final_report += f'\n\tdoublet is a gauge-level relabeling and keeps the band usable; only force-fills'
-            self.final_report += f'\n\tacross a real energy gap (counted as "suspect") downgrade a band to CHECK/FAIL.'
+            self.final_report += (
+                f"\n\n\t{n_forced} point(s) were force-filled (FOR) by the completeness pass to guarantee a"
+            )
+            self.final_report += "\n\tband attribution everywhere. These are not genuine solves: they were assigned the"
+            self.final_report += (
+                "\n\tclosest available band in energy. A force-fill that lands inside a near-degenerate"
+            )
+            self.final_report += "\n\tdoublet is a gauge-level relabeling and keeps the band usable; only force-fills"
+            self.final_report += '\n\tacross a real energy gap (counted as "suspect") downgrade a band to CHECK/FAIL.'
 
         if len(degenerates) > 0:
             # contiguous run of usable bands from the bottom (the set that can be
             # safely fed to basis rotation)
             n_contig = 0
             for i in range(self.nbnd):
-                if band_grade[i] not in ('CLEAN', 'USABLE', 'ROTATE'):
+                if band_grade[i] not in ("CLEAN", "USABLE", "ROTATE"):
                     break
                 n_contig += 1
             n_contig = max(n_contig, 1)
-            self.final_report += f'\n\n\tTo use the program basis rotation, you must run the program for the first {n_contig} bands.'
-            self.final_report += f'\n\n\t\t `$ berry basis {n_contig - 1}`'
+            self.final_report += (
+                f"\n\n\tTo use the program basis rotation, you must run the program for the first {n_contig} bands."
+            )
+            self.final_report += f"\n\n\t\t `$ berry basis {n_contig - 1}`"
 
-        self.final_report += '\n\n*************************************************************************************************\n'
+        self.final_report += (
+            "\n\n*************************************************************************************************\n"
+        )
 
         return self.final_report
 
-    def solve(self, step: float=0.5, alpha : float=1.0, min_alpha: float=0, alpha_patience: int=3) -> None:
-        '''
+    def solve(self, step: float = 0.5, alpha: float = 1.0, min_alpha: float = 0, alpha_patience: int = 3) -> None:
+        """
         This method is the main algorithm which iterates between solutions
         trying to find the best result for the material.
 
@@ -5740,7 +6008,7 @@ class MATERIAL:
                 Consecutive non-improving iterations (no new not-solved low) to
                 tolerate at one alpha before descending to the next.
                 (default 3)
-        '''
+        """
         ###########################################################################
         # Initial preparation of data structures
         # The previous and best result are stored
@@ -5749,10 +6017,12 @@ class MATERIAL:
         # min_alpha).  A non-positive step would never lower alpha, so the loop could
         # only stop if the result happened to stabilise — otherwise it spins forever (H2).
         if step <= 0:
-            raise ValueError(f"solve() requires step > 0 to converge (the alpha sweep would never advance); got step={step}.")
-        self.alpha = alpha # The initial alpha is 1.0: alpha*<i|j> + (1-alpha)*f(E)
-        COUNT = 0     # Counter iteration
-        self.final_report = ''
+            raise ValueError(
+                f"solve() requires step > 0 to converge (the alpha sweep would never advance); got step={step}."
+            )
+        self.alpha = alpha  # The initial alpha is 1.0: alpha*<i|j> + (1-alpha)*f(E)
+        COUNT = 0  # Counter iteration
+        self.final_report = ""
         self.bands_final_prev = np.copy(self.bands_final)
         self.best_bands_final = np.copy(self.bands_final)
         self.best_score = np.zeros(self.total_bands, dtype=float)
@@ -5768,9 +6038,9 @@ class MATERIAL:
         # consecutive iterations. Any new best resets the stall counter, so brief
         # oscillations are absorbed -- alpha descends only when improvement at the
         # current alpha has genuinely stopped persisting.
-        self.alpha_best_ns = np.inf      # lowest not_solved seen at the current alpha
-        self.alpha_stall = 0             # consecutive iterations with no new best
-        self.total_not_solved = np.inf   # set by correct_signal() each iteration
+        self.alpha_best_ns = np.inf  # lowest not_solved seen at the current alpha
+        self.alpha_stall = 0  # consecutive iterations with no new best
+        self.total_not_solved = np.inf  # set by correct_signal() each iteration
 
         ###########################################################################
         # Algorithm
@@ -5781,17 +6051,27 @@ class MATERIAL:
             COUNT += 1
             start_time = time.time()
             self.logger.info()
-            self.logger.info(f'\n\n\t* Iteration: {COUNT} - Clustering samples for Alpha: {self.alpha:.4f}')
-            self.get_components(alpha=self.alpha, compute_communities= COUNT == 1 or self.repeat_communities)                    # Obtain components from a Graph
+            self.logger.info(f"\n\n\t* Iteration: {COUNT} - Clustering samples for Alpha: {self.alpha:.4f}")
+            self.get_components(
+                alpha=self.alpha, compute_communities=COUNT == 1 or self.repeat_communities
+            )  # Obtain components from a Graph
 
-            self.logger.info('\n\t\tCalculating output')        
-            self.obtain_output()                            # Compute the result
-            self.print_report(self.signal_final, f'Report Number: {COUNT} considering dot-product information', header_text=EVALUATE_RESULT_HEADER)                           # Print result
+            self.logger.info("\n\t\tCalculating output")
+            self.obtain_output()  # Compute the result
+            self.print_report(
+                self.signal_final,
+                f"Report Number: {COUNT} considering dot-product information",
+                header_text=EVALUATE_RESULT_HEADER,
+            )  # Print result
 
-            self.logger.info('\n\t\tValidating result using energy continuity criteria')     
-            self.correct_signal()                           # Evaluate the energy continuity and perform a new Graph
-            self._log_fE_outcome()                          # f(E) diagnostics, Tier 4: outcome over attached points
-            self.print_report(self.correct_signalfinal, f'Validation Report Number: {COUNT} considering  energy continuity criteria', header_text=VALIDATE_RESULT_HEADER)     # Print result
+            self.logger.info("\n\t\tValidating result using energy continuity criteria")
+            self.correct_signal()  # Evaluate the energy continuity and perform a new Graph
+            self._log_fE_outcome()  # f(E) diagnostics, Tier 4: outcome over attached points
+            self.print_report(
+                self.correct_signalfinal,
+                f"Validation Report Number: {COUNT} considering  energy continuity criteria",
+                header_text=VALIDATE_RESULT_HEADER,
+            )  # Print result
 
             # This iteration's attempt, captured BEFORE the best-result revert below may
             # overwrite self.total_not_solved (the else branch re-runs correct_signal on
@@ -5830,35 +6110,51 @@ class MATERIAL:
                 not_solved = np.sum(self.correct_signalfinal[:, bn] == NOT_SOLVED)
                 not_solved_best = np.sum(self.correct_signalfinal_best[:, bn] == NOT_SOLVED)
 
-                solved_flag = not_solved == 0 
+                solved_flag = not_solved == 0
                 solved_flag_points = True
                 if COUNT > 1:
-                    solved_flag_points = mistake < mistake_best and other < other_best or score >= best_score and mistake <= mistake_best and other <= other_best
-                    solved_flag_points = solved_flag_points or (score > 0.99 and mistake + other < mistake_best + other_best)
+                    solved_flag_points = (
+                        mistake < mistake_best
+                        and other < other_best
+                        or score >= best_score
+                        and mistake <= mistake_best
+                        and other <= other_best
+                    )
+                    solved_flag_points = solved_flag_points or (
+                        score > 0.99 and mistake + other < mistake_best + other_best
+                    )
 
                 solved_flag = (solved_flag or not_solved < not_solved_best) and solved_flag_points
 
-
-                self.logger.debug(f'\n\t\t\tPrev best result for band {bn}: {best_score} mistakes: {mistake_best} other: {other_best}')
-                self.logger.debug(f'\n\t\t\tNew best result for band {bn}: {score} mistakes: {mistake} other: {other}. Solved: {solved_flag}')
+                self.logger.debug(
+                    f"\n\t\t\tPrev best result for band {bn}: {best_score} mistakes: {mistake_best} other: {other_best}"
+                )
+                self.logger.debug(
+                    f"\n\t\t\tNew best result for band {bn}: {score} mistakes: {mistake} other: {other}. Solved: {solved_flag}"
+                )
                 if score != 0 and not_solved == 0 and (score > best_score or solved_flag):
                     solved += 1
                 else:
                     break
-            
-            self.logger.info(f'\n\t\t Iteration: {COUNT} - Clustered bands: {solved} - Max clustered bands: {max_solved}')
-            self.logger.info('\t\t\t' + tempo(start_time, time.time(), name='iteration'))
-                             
+
+            self.logger.info(
+                f"\n\t\t Iteration: {COUNT} - Clustered bands: {solved} - Max clustered bands: {max_solved}"
+            )
+            self.logger.info("\t\t\t" + tempo(start_time, time.time(), name="iteration"))
+
             n_bands = len(self.final_score)
-            total_solved_flag = first_max_bands_score >= first_max_bands_best_score and total_score > total_best_score and n_not < n_not_best
-            total_solved_flag = total_solved_flag or (total_score/n_bands > 0.9 and total_best_score/n_bands < 0.9)
+            total_solved_flag = (
+                first_max_bands_score >= first_max_bands_best_score
+                and total_score > total_best_score
+                and n_not < n_not_best
+            )
+            total_solved_flag = total_solved_flag or (total_score / n_bands > 0.9 and total_best_score / n_bands < 0.9)
             # A drastically cleaner attempt (under half the reigning best's not-solved
             # count) wins even when its contiguous solved-band count is lower: the
             # per-band chain above breaks at the first non-improving band.
             # The score guard keeps a low-not-solved but
             # low-overlap solution from displacing a genuinely solved one.
-            much_cleaner = (n_not < 0.5 * n_not_best
-                            and total_score >= 0.9 * total_best_score)
+            much_cleaner = n_not < 0.5 * n_not_best and total_score >= 0.9 * total_best_score
             if total_solved_flag or much_cleaner or solved >= max_solved or COUNT == 1:
                 self.best_bands_final = np.copy(self.bands_final)
                 self.best_score = np.copy(self.final_score)
@@ -5867,18 +6163,20 @@ class MATERIAL:
                 self.correct_signalfinal_best = np.copy(self.correct_signalfinal)
                 max_solved = solved
 
-                self.logger.debug(f'\n\t\t\tNew best result')
+                self.logger.debug("\n\t\t\tNew best result")
 
             else:
                 self.bands_final = np.copy(self.best_bands_final)
                 self.final_score = np.copy(self.best_score)
-                self.degenerate_final = np.copy(self.degenerate_best)      
-                self.signal_final = np.copy(self.best_signal_final)  
+                self.degenerate_final = np.copy(self.degenerate_best)
+                self.signal_final = np.copy(self.best_signal_final)
 
                 self.correct_signal()
 
-                self.logger.info(f'\n\t\t\tBest result: {max_solved} bands')
-                self.print_report(self.correct_signalfinal, f'Validation Report: Best Iteration', header_text=VALIDATE_RESULT_HEADER)     # Print result
+                self.logger.info(f"\n\t\t\tBest result: {max_solved} bands")
+                self.print_report(
+                    self.correct_signalfinal, "Validation Report: Best Iteration", header_text=VALIDATE_RESULT_HEADER
+                )  # Print result
 
             # Pace the alpha sweep by convergence at the current alpha (not by the rebuild
             # flag). Hold alpha while not_solved keeps making new lows; descend once it
@@ -5891,16 +6189,19 @@ class MATERIAL:
             if result_stable:
                 # Fixed point at this alpha: skip the remaining patience and descend now.
                 self.alpha_stall = alpha_patience
-                self.logger.info(f'\n\t\tAlpha {self.alpha:.4f}: result repeated exactly '
-                                 f'(fixed point) -- forcing the alpha descent')
+                self.logger.info(
+                    f"\n\t\tAlpha {self.alpha:.4f}: result repeated exactly (fixed point) -- forcing the alpha descent"
+                )
             elif attempt_not_solved < self.alpha_best_ns:
                 self.alpha_best_ns = attempt_not_solved
                 self.alpha_stall = 0
             else:
                 self.alpha_stall += 1
-                self.logger.info(f'\n\t\tAlpha {self.alpha:.4f}: no improvement '
-                                 f'({attempt_not_solved} vs best {self.alpha_best_ns}) -- '
-                                 f'stall {self.alpha_stall}/{alpha_patience}')
+                self.logger.info(
+                    f"\n\t\tAlpha {self.alpha:.4f}: no improvement "
+                    f"({attempt_not_solved} vs best {self.alpha_best_ns}) -- "
+                    f"stall {self.alpha_stall}/{alpha_patience}"
+                )
 
             if self.alpha_stall >= alpha_patience:
                 self.alpha -= step
@@ -5909,12 +6210,10 @@ class MATERIAL:
                 if self.alpha < min_alpha:
                     # The sweep has exhausted its range; the loop condition ends it.
                     # Don't log a bogus "descending to -0.5000".
-                    self.logger.info(f'\n\t\tAlpha converged at the final value -- '
-                                     f'alpha sweep finished')
+                    self.logger.info("\n\t\tAlpha converged at the final value -- alpha sweep finished")
                 else:
                     self.tol = max(self.tol * 0.90, 0.10)
-                    self.logger.info(f'\n\t\tAlpha converged -- descending to '
-                                     f'{self.alpha:.4f} (tol={self.tol:.4f})')
+                    self.logger.info(f"\n\t\tAlpha converged -- descending to {self.alpha:.4f} (tol={self.tol:.4f})")
 
         # The best result is maintained
         self.bands_final = np.copy(self.best_bands_final)
@@ -5933,7 +6232,7 @@ class MATERIAL:
         # (NOT/MIS) and the unattributed ones are locally reassigned from trusted
         # trajectories. Good points are never touched.
         ###########################################################################
-        self.logger.info('\n\t\tRepairing energy discontinuities (a posteriori)')
+        self.logger.info("\n\t\tRepairing energy discontinuities (a posteriori)")
         self.repaired_mask = self._repair_energy_discontinuities()
 
         ###########################################################################
@@ -5967,7 +6266,8 @@ class MATERIAL:
         # evidence), then demote whatever zero-support cells remain so the
         # report cannot call a silently swapped band clean.
         ###########################################################################
-        self._log_refuted_census('post correct_signal')
+        self._log_refuted_census("post correct_signal")
+
         # The relocation/repair passes each have monotone acceptance, but they are
         # sensitive to their STARTING canvas: applied once to the raw in-loop
         # canvas (frontier-collision seams everywhere) they settle in a far worse
@@ -5977,8 +6277,7 @@ class MATERIAL:
         # census (refuted + cliffs + walls) stops decreasing; each pass is
         # monotone and the census is a non-negative integer, so this terminates.
         def _seam_census():
-            return (len(self._dp_refuted_seam_edges())
-                    + len(self._cliff_seam_edges()) + len(self._slot_wall_edges()))
+            return len(self._dp_refuted_seam_edges()) + len(self._cliff_seam_edges()) + len(self._slot_wall_edges())
 
         MAX_SWEEPS = 8
         prev_census = None
@@ -5991,13 +6290,13 @@ class MATERIAL:
             self._repair_dp_cycles()
             self._repair_certain_links()
             census = _seam_census()
-            self._log_refuted_census(f'post relocation sweep {_sweep + 1}')
+            self._log_refuted_census(f"post relocation sweep {_sweep + 1}")
             if prev_census is not None and census >= prev_census:
                 break
             prev_census = census
         self._repair_dp_swaps()
         self._flag_dp_unsupported()
-        self._log_refuted_census('final')
+        self._log_refuted_census("final")
         self._verify_no_cliffs()
         self._handoff_dp_residue_to_rotation()
         self._verify_no_dp_cycles()
@@ -6009,8 +6308,9 @@ class MATERIAL:
         # the validation flag. No-op unless the logger is at DEBUG level.
         self._log_solution_provenance(_prov_inloop_bands, _prov_inloop_csf)
 
+
 class COMPONENT:
-    '''
+    """
     This object contains the information that constructs a component,
     and also it has functions that are necessary to establish
     relations between components.
@@ -6041,7 +6341,7 @@ class COMPONENT:
                 default = True
         scores : dict
             Stores the last score for some component with __id__ key.
-    
+
     Methods
         calculate_pointsMatrix() : None
             Calculate the k-points' projection on a matrix representation of k-space.
@@ -6058,9 +6358,10 @@ class COMPONENT:
             This function returns the similarity between components taking
                 into account the dot product of all essential points and their
                 energy value.
-    '''
-    def __init__(self, component: nx.Graph, kpoints_index:np.ndarray, matrix: np.ndarray, dimensions:int) -> None:
-        '''
+    """
+
+    def __init__(self, component: nx.Graph, kpoints_index: np.ndarray, matrix: np.ndarray, dimensions: int) -> None:
+        """
         Setup the component information.
 
         Parameters
@@ -6089,7 +6390,7 @@ class COMPONENT:
                     default = True
             scores : dict
                 Stores the last score for some component with __id__ key.
-        '''
+        """
         self.GRAPH = component
         self.N = self.GRAPH.number_of_nodes()
         self.m_shape = matrix.shape
@@ -6100,94 +6401,93 @@ class COMPONENT:
         self.positions_matrix = None
         self.nodes = np.array(self.GRAPH.nodes)
 
-        self.__id__ = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        self.__id__ = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
         self.was_modified = True
         self.scores = {}
 
     def calculate_values(self):
         self.nodes = np.array(self.GRAPH.nodes)
-        self.k_points = self.nodes % self.nks                               # Transform node id to k-point notation
-        self.bands_number = dict(zip(self.k_points,
-                                     self.nodes//self.nks))                 # A dictionary that links the initial band to a k-point
+        self.k_points = self.nodes % self.nks  # Transform node id to k-point notation
+        self.bands_number = dict(
+            zip(self.k_points, self.nodes // self.nks)
+        )  # A dictionary that links the initial band to a k-point
 
     def calculate_pointsMatrix(self) -> None:
-        '''
+        """
         Calculate the k-points' projection on a matrix representation of k-space.
-        '''
+        """
         self.nodes = np.array(self.GRAPH.nodes)
-        self.k_points = self.nodes % self.nks                               # Transform node id to k-point notation
-        self.bands_number = dict(zip(self.k_points,
-                                     self.nodes//self.nks))
+        self.k_points = self.nodes % self.nks  # Transform node id to k-point notation
+        self.bands_number = dict(zip(self.k_points, self.nodes // self.nks))
 
-        self.positions_matrix = np.zeros(self.m_shape, int)                 # Position matrix for k-points projection
-        index_points = self.kpoints_index[self.nodes % self.nks]            # Get the k-points' indices
+        self.positions_matrix = np.zeros(self.m_shape, int)  # Position matrix for k-points projection
+        index_points = self.kpoints_index[self.nodes % self.nks]  # Get the k-points' indices
         if self.dimensions == 1:
-            self.positions_matrix[index_points] = 1                          # Mark the k-point projection
+            self.positions_matrix[index_points] = 1  # Mark the k-point projection
         elif self.dimensions == 2:
-            self.positions_matrix[index_points[:, 0], index_points[:, 1]] = 1   # Mark the k-point projection
+            self.positions_matrix[index_points[:, 0], index_points[:, 1]] = 1  # Mark the k-point projection
         else:
             self.positions_matrix[index_points[:, 0], index_points[:, 1], index_points[:, 2]] = 1
 
     def get_bands(self) -> None:
-        '''
+        """
         Get the bands associated with each node.
 
         Returns
             k_bands : array_like
                 An array with bands information.
-        '''
-        self.k_points = self.nodes % self.nks                               # Get the k-point from node
-        k_bands = self.nodes//self.nks                                      # Get the k-point's band from node
-        self.bands_number = dict(zip(self.k_points,
-                                     k_bands))                 # A dictionary that links the initial band to a k-point
-        bands, counts = np.unique(k_bands, return_counts=True)              # Count the number of nodes with each band
-        self.bands = bands[np.argsort(counts)[::-1]]                        # Save in decreasing order
+        """
+        self.k_points = self.nodes % self.nks  # Get the k-point from node
+        k_bands = self.nodes // self.nks  # Get the k-point's band from node
+        self.bands_number = dict(zip(self.k_points, k_bands))  # A dictionary that links the initial band to a k-point
+        bands, counts = np.unique(k_bands, return_counts=True)  # Count the number of nodes with each band
+        self.bands = bands[np.argsort(counts)[::-1]]  # Save in decreasing order
         return k_bands
 
-    def validate(self, component : COMPONENT) -> bool:
-        '''
+    def validate(self, component: COMPONENT) -> bool:
+        """
         Verify if the component received as a parameter can join with the current component.
 
         Parameters
             component : COMPONENT
                 It is another COMPONENT object that is trying to join the current component.
-        
+
         Returns
             validate() : bool
                 If it is true, the component does not have overlaying between k-points,
                 and the sum of nodes does not exceed the total number of k-points
-        '''
+        """
         if self.positions_matrix is None:
             # Calculates the k-space projection if it does not exist
             self.calculate_pointsMatrix()
         # Computes the overlaying between components by XOR operation between k-space projections
         N = np.sum(self.positions_matrix ^ component.positions_matrix)
-        return (component.N <= self.nks - self.N and N == self.N+component.N)
+        return component.N <= self.nks - self.N and N == self.N + component.N
 
-    def join(self, component : COMPONENT) -> None:
-        '''
+    def join(self, component: COMPONENT) -> None:
+        """
         Join the component received as a parameter with the current component.
 
         Parameter
             component : COMPONENT
                 It is another COMPONENT object to be joined to the current component.
-        '''
-        del component.scores                            # Clear the scores' information of the component
-        self.was_modified = True                        # The Component is marked as modified
-        G = nx.Graph(self.GRAPH)                        # Copy the Graph
-        G.add_nodes_from(component.GRAPH)               # Add the new nodes
-        self.GRAPH = G                                  # Set the new Graph
-        self.N = self.GRAPH.number_of_nodes()           # Atualize the number of nodes
+        """
+        del component.scores  # Clear the scores' information of the component
+        self.was_modified = True  # The Component is marked as modified
+        G = nx.Graph(self.GRAPH)  # Copy the Graph
+        G.add_nodes_from(component.GRAPH)  # Add the new nodes
+        self.GRAPH = G  # Set the new Graph
+        self.N = self.GRAPH.number_of_nodes()  # Atualize the number of nodes
         self.nodes = np.array(self.GRAPH.nodes)
         # Update the other attributes
         self.calculate_pointsMatrix()
         self.calc_boundary()
 
     def calc_boundary(self) -> None:
-        '''
+        """
         Only the boundary nodes are necessary. Therefore this function computes
         these essential nodes and uses them to compare components.
-        '''
+        """
         if self.positions_matrix is None:
             # Calculates the k-space projection if it does not exist
             self.calculate_pointsMatrix()
@@ -6198,11 +6498,11 @@ class COMPONENT:
             if len(A) > 0:
                 self.boundary[A[0]] = 1
                 self.boundary[A[-1]] = 1
-        
+
         elif self.dimensions == 2:
-            Ax = sobel(self.positions_matrix, axis=0)    # Sobel operator for x-axis
-            Ay = sobel(self.positions_matrix, axis=1)    # Sobel operator for y-axis
-            self.boundary = np.sqrt(Ax**2 + Ay**2)         # Boundary points
+            Ax = sobel(self.positions_matrix, axis=0)  # Sobel operator for x-axis
+            Ay = sobel(self.positions_matrix, axis=1)  # Sobel operator for y-axis
+            self.boundary = np.sqrt(Ax**2 + Ay**2)  # Boundary points
         else:
             Ax = sobel(self.positions_matrix, axis=0)
             Ay = sobel(self.positions_matrix, axis=1)
@@ -6211,16 +6511,24 @@ class COMPONENT:
 
         # Maintain  all marked points
         self.boundary = self.boundary * self.positions_matrix
-        self.boundary = (self.boundary > 0)
+        self.boundary = self.boundary > 0
         self.k_edges = self.matrix[self.boundary]
         if len(self.k_edges) == 0:
             self.k_edges = self.nodes % self.nks
 
-    def get_cluster_score(self, cluster : COMPONENT,
-                          neighbors : np.ndarray, energies : np.ndarray, connections : np.ndarray, alpha : float = 0.5,
-                          accept_E : float = None, disp_scale : float = None, fe_eweight : float = 1.0,
-                          tol : float = None) -> float:
-        '''
+    def get_cluster_score(
+        self,
+        cluster: COMPONENT,
+        neighbors: np.ndarray,
+        energies: np.ndarray,
+        connections: np.ndarray,
+        alpha: float = 0.5,
+        accept_E: float = None,
+        disp_scale: float = None,
+        fe_eweight: float = 1.0,
+        tol: float = None,
+    ) -> float:
+        """
         This function returns the similarity between components taking
         into account the dot product of all essential points and their
         energy value.
@@ -6241,9 +6549,10 @@ class COMPONENT:
         Return
             score: float
                 It is a float that represents the similarity between components.
-        '''
-        def difference_energy(bn1 : int, bn2 : int, iK1 : list[int], iK2: list[int], Ei : float = None) -> float:
-            '''
+        """
+
+        def difference_energy(bn1: int, bn2: int, iK1: list[int], iK2: list[int], Ei: float = None) -> float:
+            """
             Compute the score for the k-point with their neighbor by comparing all possible energies with Ei energy.
 
             Parameters
@@ -6257,11 +6566,11 @@ class COMPONENT:
                     Neighbor's indices on k-space.
                 Ei : float
                     Energy to comparison. The default is None
-            
+
             Return
                 score : float
                     If the neighbor's energy is the closest one to Ei the score is one, otherwise is between 0 and 1.
-            '''
+            """
             ik1 = iK1[0]
             ik_n = iK2[0]
             if self.dimensions >= 2:
@@ -6271,39 +6580,44 @@ class COMPONENT:
                 kk1 = iK1[2]
                 kk_n = iK2[2]
 
-            predicted = Ei is not None                                     # f(E) prediction path (Ei=Enew) vs default
-            energies_candidates = lambda bn: energies[bn, ik_n] if self.dimensions == 1 else energies[bn, ik_n, jk_n] if self.dimensions == 2 else energies[bn, ik_n, jk_n, kk_n]
+            predicted = Ei is not None  # f(E) prediction path (Ei=Enew) vs default
+            energies_candidates = lambda bn: (
+                energies[bn, ik_n]
+                if self.dimensions == 1
+                else energies[bn, ik_n, jk_n]
+                if self.dimensions == 2
+                else energies[bn, ik_n, jk_n, kk_n]
+            )
 
             if self.dimensions == 1:
-                Ei = energies[bn1, ik1] if Ei is None else Ei              # The k-point Energy is used as default
+                Ei = energies[bn1, ik1] if Ei is None else Ei  # The k-point Energy is used as default
             elif self.dimensions == 2:
                 Ei = energies[bn1, ik1, jk1] if Ei is None else Ei
             else:
-                Ei = energies[bn1, ik1, jk1, kk1] if Ei is None else Ei        
+                Ei = energies[bn1, ik1, jk1, kk1] if Ei is None else Ei
 
-            Ecand = energies_candidates(bn2)                               # Candidate (neighbour band) energy
-            delta_energy = np.abs(Ei - Ecand)                              # Directional residual: prediction vs THIS candidate
+            Ecand = energies_candidates(bn2)  # Candidate (neighbour band) energy
+            delta_energy = np.abs(Ei - Ecand)  # Directional residual: prediction vs THIS candidate
             if _FE_DEBUG and predicted:
                 # f(E) diagnostics, Tier 2: residual = how far the extrapolated
                 # energy (Ei=Enew) lands from the neighbour it is scored against.
-                _FE_STATS['resid_n'] += 1
-                _FE_STATS['resid_buckets'][_fe_resid_bucket(float(delta_energy), disp_scale)] += 1
+                _FE_STATS["resid_n"] += 1
+                _FE_STATS["resid_buckets"][_fe_resid_bucket(float(delta_energy), disp_scale)] += 1
             # Directional continuity-residual with a gross-jump gate:
             # score the candidate
             # band against the prediction along the join line ONLY, and veto any
             # jump beyond the gate (a real inter-group wall can never be crossed).
             # The gate stays at the GLOBAL scales on purpose: band_disp is a p95, so
-            # ~5% of genuine one-step dispersions exceed it 
+            # ~5% of genuine one-step dispersions exceed it
             # and a locally sharpened gate vetoes real continuations in
             # the steep parts of a resolved manifold, fragmenting clusters. The local
             # gates (_local_accept) stay where a trusted trajectory exists to judge
             # against: seeds/growth in _partition_fused_component, the repair pass,
             # the outlier mask and the completeness fill.
-            return _energy_continuity_score(float(Ei), float(Ecand),
-                                            accept_E=accept_E, disp_scale=disp_scale)
-        
-        def fit_energy(bn1 : int, bn2 : int, iK1 : list[int], iK2: list[int]) -> float:
-            '''
+            return _energy_continuity_score(float(Ei), float(Ecand), accept_E=accept_E, disp_scale=disp_scale)
+
+        def fit_energy(bn1: int, bn2: int, iK1: list[int], iK2: list[int]) -> float:
+            """
             Computes the best energy approximation for the neighbor's position.
 
             Parameters
@@ -6315,12 +6629,12 @@ class COMPONENT:
                     K-point's indices on k-space.
                 iK2 : list[int]
                     Neighbor's indices on k-space.
-            
+
             Return
                 score : float
                     Result of difference_energy function using the computed Energy.
-            '''
-            N = 4                                                               # Number of points to take account into the curve fitting
+            """
+            N = 4  # Number of points to take account into the curve fitting
 
             ###########################################################################
             # f(E): cliff-aware, dispersion-clipped one-step extrapolation,
@@ -6330,12 +6644,12 @@ class COMPONENT:
             # quadratic fit exactly, so the change is a no-op unless wired in.
             ###########################################################################
             use_new_fE = accept_E is not None and disp_scale is not None
-            _accept_E  = accept_E if accept_E is not None else np.inf
-            _disp      = disp_scale if disp_scale is not None else np.inf
-            pol = lambda x, a, b, c: a*x**2 + b*x + c                            # Second order polynomial
+            _accept_E = accept_E if accept_E is not None else np.inf
+            _disp = disp_scale if disp_scale is not None else np.inf
+            pol = lambda x, a, b, c: a * x**2 + b * x + c  # Second order polynomial
 
             def predict_energy(X, Es, bands, new_x):
-                '''
+                """
                 One-step energy prediction at ``new_x`` from the band's own trajectory.
                 ``X``/``Es``/``bands`` are ordered anchor-first: X[0] is the k-point
                 nearest the neighbour. With the new f(E) enabled the walk is truncated
@@ -6346,12 +6660,12 @@ class COMPONENT:
                 than 4 continuous points remain (caller falls back to the
                 nearest-neighbour energy default). With the new f(E) disabled it is the
                 original plain quadratic fit over all supplied points.
-                '''
+                """
                 X = np.asarray(X, dtype=float)
                 Es = np.asarray(Es, dtype=float)
                 bands = np.asarray(bands)
                 if _FE_DEBUG:
-                    _FE_STATS['calls'] += 1
+                    _FE_STATS["calls"] += 1
                 if use_new_fE:
                     Xt, Et = [X[0]], [Es[0]]
                     b_anchor = bands[0]
@@ -6359,32 +6673,34 @@ class COMPONENT:
                         ejump = abs(e - Et[-1]) > _accept_E
                         if ejump or b != b_anchor:
                             if _FE_DEBUG:
-                                _FE_STATS['brk_ejump' if ejump else 'brk_band'] += 1
-                            break                                               # cliff: stop the walk
-                        Xt.append(x); Et.append(e)
+                                _FE_STATS["brk_ejump" if ejump else "brk_band"] += 1
+                            break  # cliff: stop the walk
+                        Xt.append(x)
+                        Et.append(e)
                     if _FE_DEBUG:
-                        _FE_STATS['kept_len_sum'] += len(Et)
+                        _FE_STATS["kept_len_sum"] += len(Et)
                         if len(Et) < len(X):
-                            _FE_STATS['trunc'] += 1
+                            _FE_STATS["trunc"] += 1
                     if len(Et) <= 3:
                         if _FE_DEBUG:
-                            _FE_STATS['fallback'] += 1
-                        return None                                             # too few continuous points
+                            _FE_STATS["fallback"] += 1
+                        return None  # too few continuous points
                 else:
                     Xt, Et = X, Es
                     if _FE_DEBUG:
-                        _FE_STATS['kept_len_sum'] += len(Et)
+                        _FE_STATS["kept_len_sum"] += len(Et)
                 popt, _ = curve_fit(pol, Xt, Et)
                 Enew = float(pol(new_x, *popt))
                 if use_new_fE:
                     E0 = float(Et[0])
-                    clipped = min(max(Enew, E0 - _disp), E0 + _disp)            # local dispersion window
+                    clipped = min(max(Enew, E0 - _disp), E0 + _disp)  # local dispersion window
                     if _FE_DEBUG and clipped != Enew:
-                        _FE_STATS['clip_hit'] += 1
+                        _FE_STATS["clip_hit"] += 1
                     Enew = clipped
                 if _FE_DEBUG:
-                    _FE_STATS['fit'] += 1
+                    _FE_STATS["fit"] += 1
                 return Enew
+
             ik1 = iK1[0]
             ik_n = iK2[0]
             if self.dimensions >= 2:
@@ -6393,24 +6709,25 @@ class COMPONENT:
             if self.dimensions == 3:
                 kk1 = iK1[2]
                 kk_n = iK2[2]
-            
 
             ###########################################################################
             # Preparation of the points' indices
             ###########################################################################
 
             if self.dimensions == 1:
-                I = np.full(N+1,ik1)                                                # Repeat N+1 times the ik1 value  
-                i = I + np.arange(0,N+1)*np.sign(ik1-ik_n)
+                I = np.full(N + 1, ik1)  # Repeat N+1 times the ik1 value
+                i = I + np.arange(0, N + 1) * np.sign(ik1 - ik_n)
                 i = i[i >= 0]
                 i = i[i < self.m_shape[0]]
                 ###########################################################################
                 # Computes the best energy using the points above defined
                 ###########################################################################
-                ks = self.matrix[i]                                                  # Select k-points on positions delimited by the (i,j) indices
-                f = lambda e: e in self.k_points                                     # Auxiliar lambda function to verify if an e point is inside component's k-points
-                exist_ks = list(map(f, ks))                                          # Apply f to all ks
-                ks = ks[exist_ks]                                                    # Maintain only the existent k-points
+                ks = self.matrix[i]  # Select k-points on positions delimited by the (i,j) indices
+                f = lambda e: (
+                    e in self.k_points
+                )  # Auxiliar lambda function to verify if an e point is inside component's k-points
+                exist_ks = list(map(f, ks))  # Apply f to all ks
+                ks = ks[exist_ks]  # Maintain only the existent k-points
                 if len(ks) <= 3:
                     # It is necessary at least 3 points to fitting a second order curve
                     # If there are not enough points is used the difference_energy's default
@@ -6419,24 +6736,23 @@ class COMPONENT:
                 bands = aux_bands
                 # Use the existent k-points' indices
                 i = i[exist_ks]
-                Es = energies[bands, i]                                              # Get the ks' energies
-                X = i                                                               # Obtain the x values for Es.
-                new_x = ik_n                                                         # Get the position to approximate the energy
+                Es = energies[bands, i]  # Get the ks' energies
+                X = i  # Obtain the x values for Es.
+                new_x = ik_n  # Get the position to approximate the energy
 
-                Enew = predict_energy(X, Es, bands, new_x)                          # Cliff-aware, clipped prediction
+                Enew = predict_energy(X, Es, bands, new_x)  # Cliff-aware, clipped prediction
                 if Enew is None:
-                    return difference_energy(bn1, bn2, iK1, iK2)                    # no continuous segment -> default
-                return difference_energy(bn1, bn2, iK1, iK2, Ei = Enew)             # Score
+                    return difference_energy(bn1, bn2, iK1, iK2)  # no continuous segment -> default
+                return difference_energy(bn1, bn2, iK1, iK2, Ei=Enew)  # Score
 
             if self.dimensions == 2:
-
-                I = np.full(N+1,ik1)                                                # Repeat N+1 times the ik1 value  
-                J = np.full(N+1,jk1)                                                # Repeat N+1 times the jk1 value  
-                flag = ik1 == ik_n                                                  # Identify the neighbor's direction
+                I = np.full(N + 1, ik1)  # Repeat N+1 times the ik1 value
+                J = np.full(N + 1, jk1)  # Repeat N+1 times the jk1 value
+                flag = ik1 == ik_n  # Identify the neighbor's direction
                 # Take the (i,j) indices of N+1 points
-                i = I if flag else I + np.arange(0,N+1)*np.sign(ik1-ik_n)
-                j = J if not flag else J + np.arange(0,N+1)*np.sign(jk1-jk_n)
-                
+                i = I if flag else I + np.arange(0, N + 1) * np.sign(ik1 - ik_n)
+                j = J if not flag else J + np.arange(0, N + 1) * np.sign(jk1 - jk_n)
+
                 if not flag:
                     # If the neighbor is in jk's direction then i is corrected to be inside boundaries.
                     # The shape of js indices is corrected
@@ -6453,41 +6769,42 @@ class COMPONENT:
                 ###########################################################################
                 # Computes the best energy using the points above defined
                 ###########################################################################
-                ks = self.matrix[i, j]                                                  # Select k-points on positions delimited by the (i,j) indices
-                f = lambda e: e in self.k_points                                        # Auxiliar lambda function to verify if an e point is inside component's k-points
-                exist_ks = list(map(f, ks))                                             # Apply f to all ks
-                ks = ks[exist_ks]                                                       # Maintain only the existent k-points
+                ks = self.matrix[i, j]  # Select k-points on positions delimited by the (i,j) indices
+                f = lambda e: (
+                    e in self.k_points
+                )  # Auxiliar lambda function to verify if an e point is inside component's k-points
+                exist_ks = list(map(f, ks))  # Apply f to all ks
+                ks = ks[exist_ks]  # Maintain only the existent k-points
                 if len(ks) <= 3:
                     # It is necessary at least 3 points to fitting a second order curve
                     # If there are not enough points is used the difference_energy's default
                     return difference_energy(bn1, bn2, iK1, iK2)
-                aux_bands = np.array([self.bands_number[kp] for kp in ks])              # Get the ks' bands
+                aux_bands = np.array([self.bands_number[kp] for kp in ks])  # Get the ks' bands
                 bands = aux_bands
                 # Use the existent k-points' indices
                 i = i[exist_ks]
                 j = j[exist_ks]
-                Es = energies[bands, i, j]                                              # Get the ks' energies
-                X = i if jk1 == jk_n else j                                             # Obtain the x values for Es.
-                new_x = ik_n if jk1 == jk_n else jk_n                                   # Get the position to approximate the energy
+                Es = energies[bands, i, j]  # Get the ks' energies
+                X = i if jk1 == jk_n else j  # Obtain the x values for Es.
+                new_x = ik_n if jk1 == jk_n else jk_n  # Get the position to approximate the energy
 
-                Enew = predict_energy(X, Es, bands, new_x)                              # Cliff-aware, clipped prediction
+                Enew = predict_energy(X, Es, bands, new_x)  # Cliff-aware, clipped prediction
                 if Enew is None:
-                    return difference_energy(bn1, bn2, iK1, iK2)                        # no continuous segment -> default
-                return difference_energy(bn1, bn2, iK1, iK2, Ei = Enew)                 # Score
+                    return difference_energy(bn1, bn2, iK1, iK2)  # no continuous segment -> default
+                return difference_energy(bn1, bn2, iK1, iK2, Ei=Enew)  # Score
 
             if self.dimensions == 3:
-                    
-                I = np.full(N+1,ik1)                                                    # Repeat N+1 times the ik1 value  
-                J = np.full(N+1,jk1)                                                    # Repeat N+1 times the jk1 value  
-                K = np.full(N+1,kk1)                                                    # Repeat N+1 times the kk1 value  
-                flag_i = ik1 == ik_n                                                      # Identify the neighbor's direction
-                flag_j = jk1 == jk_n                                                      # Identify the neighbor's direction
+                I = np.full(N + 1, ik1)  # Repeat N+1 times the ik1 value
+                J = np.full(N + 1, jk1)  # Repeat N+1 times the jk1 value
+                K = np.full(N + 1, kk1)  # Repeat N+1 times the kk1 value
+                flag_i = ik1 == ik_n  # Identify the neighbor's direction
+                flag_j = jk1 == jk_n  # Identify the neighbor's direction
                 # Take the (i,j, k) indices of N+1 points
-                i = I if flag_i else I + np.arange(0,N+1)*np.sign(ik1-ik_n)
-                j = J if flag_j else J + np.arange(0,N+1)*np.sign(jk1-jk_n)
-                k = K if not flag_i and not flag_j else K + np.arange(0,N+1)*np.sign(kk1-kk_n)
+                i = I if flag_i else I + np.arange(0, N + 1) * np.sign(ik1 - ik_n)
+                j = J if flag_j else J + np.arange(0, N + 1) * np.sign(jk1 - jk_n)
+                k = K if not flag_i and not flag_j else K + np.arange(0, N + 1) * np.sign(kk1 - kk_n)
 
-                if not flag_i:   
+                if not flag_i:
                     # If the neighbor is in jk's direction then i is corrected to be inside boundaries.
                     # The shape of js indices is corrected
                     i = i[i >= 0]
@@ -6512,29 +6829,34 @@ class COMPONENT:
                 ###########################################################################
                 # Computes the best energy using the points above defined
                 ###########################################################################
-                ks = self.matrix[i, j, k]                                               # Select k-points on positions delimited by the (i,j) indices
-                f = lambda e: e in self.k_points                                        # Auxiliar lambda function to verify if an e point is inside component's k-points
-                exist_ks = list(map(f, ks))                                             # Apply f to all ks
-                ks = ks[exist_ks]                                                       # Maintain only the existent k-points
+                ks = self.matrix[i, j, k]  # Select k-points on positions delimited by the (i,j) indices
+                f = lambda e: (
+                    e in self.k_points
+                )  # Auxiliar lambda function to verify if an e point is inside component's k-points
+                exist_ks = list(map(f, ks))  # Apply f to all ks
+                ks = ks[exist_ks]  # Maintain only the existent k-points
                 if len(ks) <= 3:
                     # It is necessary at least 3 points to fitting a second order curve
                     # If there are not enough points is used the difference_energy's default
                     return difference_energy(bn1, bn2, iK1, iK2)
-                aux_bands = np.array([self.bands_number[kp] for kp in ks])              # Get the ks' bands
+                aux_bands = np.array([self.bands_number[kp] for kp in ks])  # Get the ks' bands
                 bands = aux_bands
                 # Use the existent k-points' indices
                 i = i[exist_ks]
                 j = j[exist_ks]
                 k = k[exist_ks]
-                Es = energies[bands, i, j, k]                                           # Get the ks' energies
-                X = i if jk1 == jk_n and kk1 == kk_n else j if ik1 == ik_n and kk1 == kk_n else k # Obtain the x values for Es.
-                new_x = ik_n if jk1 == jk_n and kk1 == kk_n else jk_n if ik1 == ik_n and kk1 == kk_n else kk_n # Get the position to approximate the energy
+                Es = energies[bands, i, j, k]  # Get the ks' energies
+                X = (
+                    i if jk1 == jk_n and kk1 == kk_n else j if ik1 == ik_n and kk1 == kk_n else k
+                )  # Obtain the x values for Es.
+                new_x = (
+                    ik_n if jk1 == jk_n and kk1 == kk_n else jk_n if ik1 == ik_n and kk1 == kk_n else kk_n
+                )  # Get the position to approximate the energy
 
-                Enew = predict_energy(X, Es, bands, new_x)                              # Cliff-aware, clipped prediction
+                Enew = predict_energy(X, Es, bands, new_x)  # Cliff-aware, clipped prediction
                 if Enew is None:
-                    return difference_energy(bn1, bn2, iK1, iK2)                        # no continuous segment -> default
-                return difference_energy(bn1, bn2, iK1, iK2, Ei = Enew)                 # Score
-                
+                    return difference_energy(bn1, bn2, iK1, iK2)  # no continuous segment -> default
+                return difference_energy(bn1, bn2, iK1, iK2, Ei=Enew)  # Score
 
         ###########################################################################
         # Computes the final score between components
@@ -6548,16 +6870,16 @@ class COMPONENT:
         for k in self.k_edges:
             # Each k-point is compared with his respective neighbor
             # that belongs to the comparison component
-            bn1 = self.bands_number[k]                                               # k-point's band
+            bn1 = self.bands_number[k]  # k-point's band
 
             ik_point_index = []
             ik1 = self.kpoints_index[k, 0] if self.dimensions > 1 else self.kpoints_index[k]
             ik_point_index.append(ik1)
             if self.dimensions >= 2:
-                jk1 = self.kpoints_index[k, 1]                                        # k-point idices
+                jk1 = self.kpoints_index[k, 1]  # k-point idices
                 ik_point_index.append(jk1)
             if self.dimensions == 3:
-                kk1 = self.kpoints_index[k, 2]                                   # k-point idices
+                kk1 = self.kpoints_index[k, 2]  # k-point idices
                 ik_point_index.append(kk1)
 
             for i_neig, k_n in enumerate(neighbors[k]):
@@ -6570,13 +6892,13 @@ class COMPONENT:
                 ik_n = cluster.kpoints_index[k_n, 0] if self.dimensions > 1 else cluster.kpoints_index[k_n]
                 ik_n_point_index.append(ik_n)
                 if self.dimensions >= 2:
-                    jk_n = cluster.kpoints_index[k_n, 1]                             # neighbor's indices
+                    jk_n = cluster.kpoints_index[k_n, 1]  # neighbor's indices
                     ik_n_point_index.append(jk_n)
                 if self.dimensions == 3:
-                    kk_n = cluster.kpoints_index[k_n, 2]                             # neighbor's indices
+                    kk_n = cluster.kpoints_index[k_n, 2]  # neighbor's indices
                     ik_n_point_index.append(kk_n)
-                bn2 = cluster.bands_number[k_n]                                     # neighbor's band
-                connection = connections[k, i_neig, bn1, bn2]                       # Dot product between k-point and his neighbor
+                bn2 = cluster.bands_number[k_n]  # neighbor's band
+                connection = connections[k, i_neig, bn1, bn2]  # Dot product between k-point and his neighbor
                 energy_val = fit_energy(bn1, bn2, ik_point_index, ik_n_point_index)
                 # Gross-jump gate: fit_energy returns exactly 0.0 only when the
                 # candidate band sits across an energy wall (|dE| > accept_E).
@@ -6597,8 +6919,7 @@ class COMPONENT:
                 # bridge two orthogonal (degenerate-pair) partners. Genuine
                 # crossings -- where the same-band overlap has collapsed -- keep
                 # same <= tol and are NOT vetoed.
-                if tol is not None and bn1 != bn2 and \
-                        connections[k, i_neig, bn1, bn1] > tol:
+                if tol is not None and bn1 != bn2 and connections[k, i_neig, bn1, bn1] > tol:
                     gate = 0.0
                 # Down-weight f(E) when the gap has collapsed (fe_eweight < 1) and
                 # renormalise so the dot product carries the freed weight. With
@@ -6609,10 +6930,10 @@ class COMPONENT:
                 if _FE_DEBUG:
                     # f(E) diagnostics, Tier 1: relative weight each term carries in
                     # the blended score. If eng_sum << conn_sum, f(E) is drowned out.
-                    _FE_STATS['pair_n'] += 1
-                    _FE_STATS['conn_sum'] += float(gate * w_c * connection)
-                    _FE_STATS['eng_sum'] += float(gate * w_e * energy_val)
-                score += gate * (w_c*connection + w_e*energy_val)                   # Calculates the final k-point score
-        score /= count_k if count_k > 0 else 1                                             # Get the final score
-        self.scores[cluster.__id__] = score                                         # Store the score
+                    _FE_STATS["pair_n"] += 1
+                    _FE_STATS["conn_sum"] += float(gate * w_c * connection)
+                    _FE_STATS["eng_sum"] += float(gate * w_e * energy_val)
+                score += gate * (w_c * connection + w_e * energy_val)  # Calculates the final k-point score
+        score /= count_k if count_k > 0 else 1  # Get the final score
+        self.scores[cluster.__id__] = score  # Store the score
         return score

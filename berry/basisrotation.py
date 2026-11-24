@@ -1,40 +1,41 @@
 """
-  Basis rotation of degenerate Bloch wavefunctions, driven by the degenerate
-  k-points found during the clustering step (``cluster`` or ``cluster0``).
+Basis rotation of degenerate Bloch wavefunctions, driven by the degenerate
+k-points found during the clustering step (``cluster`` or ``cluster0``).
 
-  This is the *a posteriori* twin of ``degenrotation``: it runs AFTER cluster
-  and reuses the exact same rotation machinery (connected-zone construction,
-  SVD/Procrustes alignment, holonomy correction, iterative gauge refinement,
-  BFS propagation), but takes its list of degenerate points from the
-  clustering's ``degeneratefinal.npy`` instead of detecting degeneracies by
-  energy.  ``degenrotation`` remains the *a priori* tool (run before cluster),
-  which detects degeneracies directly from the eigenvalues.
+This is the *a posteriori* twin of ``degenrotation``: it runs AFTER cluster
+and reuses the exact same rotation machinery (connected-zone construction,
+SVD/Procrustes alignment, holonomy correction, iterative gauge refinement,
+BFS propagation), but takes its list of degenerate points from the
+clustering's ``degeneratefinal.npy`` instead of detecting degeneracies by
+energy.  ``degenrotation`` remains the *a priori* tool (run before cluster),
+which detects degeneracies directly from the eigenvalues.
 
-  Behaviour:
-    * A flagged k-point with no flagged neighbour forms a single-point zone and
-      is rotated against its best clean (non-degenerate) external neighbour.
-    * Flagged k-points adjacent to each other form a connected zone; the
-      rotation is propagated across the whole zone via BFS.
-    * Only flagged k-points are ever written; clean neighbours are read as
-      reference anchors but never modified.
+Behaviour:
+  * A flagged k-point with no flagged neighbour forms a single-point zone and
+    is rotated against its best clean (non-degenerate) external neighbour.
+  * Flagged k-points adjacent to each other form a connected zone; the
+    rotation is propagated across the whole zone via BFS.
+  * Only flagged k-points are ever written; clean neighbours are read as
+    reference anchors but never modified.
 
-  For collinear calculations each wavefunction is a complex array of shape (nr,);
-  rotated wavefunctions overwrite ``k0{nk}b0{band}.wfc`` in place.
-  For non-collinear calculations each wavefunction is a spinor pair stored as
-  ``-0``/``-1`` files; the same N x N unitary is applied to both components.
+For collinear calculations each wavefunction is a complex array of shape (nr,);
+rotated wavefunctions overwrite ``k0{nk}b0{band}.wfc`` in place.
+For non-collinear calculations each wavefunction is a spinor pair stored as
+``-0``/``-1`` files; the same N x N unitary is applied to both components.
 """
-import os
+
 import logging
-from collections import defaultdict
 import multiprocessing as mp
+import os
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
 from berry import log
-from berry._subroutines.rotation_core import (
-    _process_zone, build_zones, _available_memory_bytes,
-)
+from berry._subroutines.rotation_core import _available_memory_bytes
+from berry._subroutines.rotation_core import _process_zone
+from berry._subroutines.rotation_core import build_zones
 
 try:
     import berry._subroutines.loaddata as d
@@ -62,6 +63,7 @@ _zone_ctx: dict = {}
 # Phase 1' — read degenerate points from the clustering output
 # ---------------------------------------------------------------------------
 
+
 def _union_pairs(pairs: list) -> list:
     """Merge degenerate band pairs that share a band into maximal groups.
 
@@ -72,7 +74,7 @@ def _union_pairs(pairs: list) -> list:
     groups: list = []
     for p in pairs:
         p = set(p)
-        overlap     = [g for g in groups if g & p]
+        overlap = [g for g in groups if g & p]
         non_overlap = [g for g in groups if not (g & p)]
         for g in overlap:
             p |= g
@@ -80,8 +82,9 @@ def _union_pairs(pairs: list) -> list:
     return [frozenset(g) for g in groups]
 
 
-def _degen_at_k_from_cluster(degeneratefinal, eigenvalues, nbnd, initial_band,
-                             bands_final, logger, group_ethr=None) -> dict:
+def _degen_at_k_from_cluster(
+    degeneratefinal, eigenvalues, nbnd, initial_band, bands_final, logger, group_ethr=None
+) -> dict:
     """Build ``degen_at_k = {nk: [frozenset(absolute_bands), ...]}`` from the
     clustering's ``degeneratefinal.npy``.
 
@@ -118,8 +121,7 @@ def _degen_at_k_from_cluster(degeneratefinal, eigenvalues, nbnd, initial_band,
     deg = np.atleast_2d(np.asarray(degeneratefinal))
     if deg.ndim != 2 or deg.shape[1] < 3:
         logger.warning(
-            f"\tdegeneratefinal has unexpected shape {deg.shape}; "
-            f"expected (N, >=3) rows [k, b1, b2]. Nothing to do."
+            f"\tdegeneratefinal has unexpected shape {deg.shape}; expected (N, >=3) rows [k, b1, b2]. Nothing to do."
         )
         return {}
 
@@ -166,8 +168,7 @@ def _degen_at_k_from_cluster(degeneratefinal, eigenvalues, nbnd, initial_band,
     logger.info(
         f"\tRead {n_used} degenerate pair(s) from cluster across "
         f"{len(degen_at_k)} k-point(s)"
-        + (f"; dropped {n_filtered} pair(s) with energy gap >= {group_ethr} Ry (non-degenerate)"
-           if n_filtered else "")
+        + (f"; dropped {n_filtered} pair(s) with energy gap >= {group_ethr} Ry (non-degenerate)" if n_filtered else "")
         + (f"; skipped {n_skipped} unusable row(s)" if n_skipped else "")
     )
     return degen_at_k
@@ -177,41 +178,46 @@ def _degen_at_k_from_cluster(degeneratefinal, eigenvalues, nbnd, initial_band,
 # Parallel zone worker
 # ---------------------------------------------------------------------------
 
+
 def _process_zone_worker(args: tuple) -> list:
     """Fork-based parallel zone worker (reads shared data from _zone_ctx)."""
     zi, sig, zone = args
     ctx = _zone_ctx
     import logging as _logging
-    logger = _logging.getLogger(ctx['logger_name'])
+
+    logger = _logging.getLogger(ctx["logger_name"])
     return _process_zone(
-        zi=zi, sig=sig, zone=zone,
-        d_phase         = ctx['d_phase'],
-        eigenvalues     = ctx['eigenvalues'],
-        neighbors       = ctx['neighbors'],
-        noncolin        = ctx['noncolin'],
-        wfcdir          = ctx['wfcdir'],
-        nr              = ctx['nr'],
-        n_dir           = ctx['n_dir'],
-        compress        = ctx['compress'],
-        ethr            = ctx['ethr'],
-        max_refinement_iter   = ctx['max_refinement_iter'],
-        refinement_iter_cap   = ctx['refinement_iter_cap'],
-        refinement_anderson_m = ctx['refinement_anderson_m'],
-        refinement_tol        = ctx['refinement_tol'],
-        holonomy_correction      = ctx['holonomy_correction'],
-        holonomy_max_iter        = ctx['holonomy_max_iter'],
-        holonomy_tol             = ctx['holonomy_tol'],
-        use_wfc_cache            = ctx['use_wfc_cache'],
-        n_workers                = 1,  # avoid nested parallelism inside a worker
-        logger                   = logger,
-        holonomy_min_plaquettes  = ctx.get('holonomy_min_plaquettes', 2),
-        mem_budget_bytes         = ctx.get('mem_budget_bytes'),
+        zi=zi,
+        sig=sig,
+        zone=zone,
+        d_phase=ctx["d_phase"],
+        eigenvalues=ctx["eigenvalues"],
+        neighbors=ctx["neighbors"],
+        noncolin=ctx["noncolin"],
+        wfcdir=ctx["wfcdir"],
+        nr=ctx["nr"],
+        n_dir=ctx["n_dir"],
+        compress=ctx["compress"],
+        ethr=ctx["ethr"],
+        max_refinement_iter=ctx["max_refinement_iter"],
+        refinement_iter_cap=ctx["refinement_iter_cap"],
+        refinement_anderson_m=ctx["refinement_anderson_m"],
+        refinement_tol=ctx["refinement_tol"],
+        holonomy_correction=ctx["holonomy_correction"],
+        holonomy_max_iter=ctx["holonomy_max_iter"],
+        holonomy_tol=ctx["holonomy_tol"],
+        use_wfc_cache=ctx["use_wfc_cache"],
+        n_workers=1,  # avoid nested parallelism inside a worker
+        logger=logger,
+        holonomy_min_plaquettes=ctx.get("holonomy_min_plaquettes", 2),
+        mem_budget_bytes=ctx.get("mem_budget_bytes"),
     )
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def run_basis_rotation(
     max_band: int = -1,
@@ -238,7 +244,7 @@ def run_basis_rotation(
     n_workers = npr
 
     initial_band = m.initial_band if m.initial_band != "dummy" else 0
-    final_band   = m.final_band
+    final_band = m.final_band
 
     # ------------------------------------------------------------------
     # Log run parameters
@@ -251,9 +257,11 @@ def run_basis_rotation(
     logger.info(f"\tDimensions: {m.dimensions}")
     logger.info(f"\tNoncollinear: {m.noncolin}")
     logger.info(f"\tEnergy threshold (reference selection): {ethr}")
-    logger.info(f"\tEnergy-coherence grouping threshold: "
-                + (f"{group_ethr}" if group_ethr is None else f"{group_ethr} Ry")
-                + ("  (disabled — trusting all cluster flags)" if group_ethr is None else ""))
+    logger.info(
+        "\tEnergy-coherence grouping threshold: "
+        + (f"{group_ethr}" if group_ethr is None else f"{group_ethr} Ry")
+        + ("  (disabled — trusting all cluster flags)" if group_ethr is None else "")
+    )
     logger.info(
         f"\tHolonomy correction: {holonomy_correction}  "
         f"(max_iter={holonomy_max_iter}, tol={holonomy_tol:.1e}, "
@@ -268,10 +276,7 @@ def run_basis_rotation(
     # ------------------------------------------------------------------
     def _require(path, hint):
         if not os.path.isfile(path):
-            logger.error(
-                f"\tRequired input '{os.path.basename(path)}' not found in {m.data_dir}.\n"
-                f"\t{hint}"
-            )
+            logger.error(f"\tRequired input '{os.path.basename(path)}' not found in {m.data_dir}.\n\t{hint}")
             logger.footer()
             raise SystemExit(1)
         return np.load(path)
@@ -280,16 +285,18 @@ def run_basis_rotation(
     # taken directly between them, so phase.npy is no longer loaded.
     # d_phase=None is threaded through to keep the rotation_core signatures
     # unchanged.
-    d_phase     = None
-    eigenvalues = d.eigenvalues                                     # shape (nks, nbnd)
-    neighbors   = d.neighbors                                       # shape (nks, 2*dimensions)
+    d_phase = None
+    eigenvalues = d.eigenvalues  # shape (nks, nbnd)
+    neighbors = d.neighbors  # shape (nks, 2*dimensions)
 
     logger.info(f"\tEigenvalues loaded, shape: {eigenvalues.shape}")
 
-    bands_final     = _require(os.path.join(m.data_dir, "bandsfinal.npy"),
-                               "Run 'berry cluster' (or 'cluster0') before basis rotation.")
-    degeneratefinal = _require(os.path.join(m.data_dir, "degeneratefinal.npy"),
-                               "Run 'berry cluster' (or 'cluster0') before basis rotation.")
+    bands_final = _require(
+        os.path.join(m.data_dir, "bandsfinal.npy"), "Run 'berry cluster' (or 'cluster0') before basis rotation."
+    )
+    degeneratefinal = _require(
+        os.path.join(m.data_dir, "degeneratefinal.npy"), "Run 'berry cluster' (or 'cluster0') before basis rotation."
+    )
     logger.info(f"\tRead bandsfinal.npy {bands_final.shape} and degeneratefinal.npy")
     logger.info()
 
@@ -300,7 +307,12 @@ def run_basis_rotation(
     logger.info()
 
     degen_at_k = _degen_at_k_from_cluster(
-        degeneratefinal, eigenvalues, m.nbnd, initial_band, bands_final, logger,
+        degeneratefinal,
+        eigenvalues,
+        m.nbnd,
+        initial_band,
+        bands_final,
+        logger,
         group_ethr=group_ethr,
     )
 
@@ -342,8 +354,9 @@ def run_basis_rotation(
     zones = build_zones(degen_at_k, neighbors, 2 * m.dimensions)
 
     n_isolated = sum(1 for _, z in zones if len(z) == 1)
-    logger.info(f"\tFormed {len(zones)} zone(s): "
-                f"{n_isolated} isolated point(s), {len(zones) - n_isolated} multi-point zone(s)")
+    logger.info(
+        f"\tFormed {len(zones)} zone(s): {n_isolated} isolated point(s), {len(zones) - n_isolated} multi-point zone(s)"
+    )
     for zi, (sig, zone) in enumerate(zones):
         kind = "isolated" if len(zone) == 1 else "zone"
         logger.info(f"\t  Zone {zi:>4} [{kind}]: bands {sorted(sig)}, {len(zone)} k-point(s)")
@@ -354,28 +367,30 @@ def run_basis_rotation(
     # ==================================================================
     logger.info("\t****  Phases 3 & 4: Reference selection and BFS rotation propagation  ****")
 
-    _zone_ctx.update({
-        'd_phase':               d_phase,
-        'eigenvalues':           eigenvalues,
-        'neighbors':             neighbors,
-        'noncolin':              m.noncolin,
-        'wfcdir':                m.wfcdirectory,
-        'nr':                    m.nr,
-        'n_dir':                 2 * m.dimensions,
-        'compress':              compress,
-        'ethr':                  ethr,
-        'max_refinement_iter':   max_refinement_iter,
-        'refinement_iter_cap':   refinement_iter_cap,
-        'refinement_anderson_m': refinement_anderson_m,
-        'refinement_tol':        refinement_tol,
-        'holonomy_correction':      holonomy_correction,
-        'holonomy_max_iter':        holonomy_max_iter,
-        'holonomy_tol':             holonomy_tol,
-        'holonomy_min_plaquettes':  holonomy_min_plaquettes,
-        'use_wfc_cache':            use_wfc_cache,
-        'logger_name':           logger_name,
-        'logger_level':          logger_level,
-    })
+    _zone_ctx.update(
+        {
+            "d_phase": d_phase,
+            "eigenvalues": eigenvalues,
+            "neighbors": neighbors,
+            "noncolin": m.noncolin,
+            "wfcdir": m.wfcdirectory,
+            "nr": m.nr,
+            "n_dir": 2 * m.dimensions,
+            "compress": compress,
+            "ethr": ethr,
+            "max_refinement_iter": max_refinement_iter,
+            "refinement_iter_cap": refinement_iter_cap,
+            "refinement_anderson_m": refinement_anderson_m,
+            "refinement_tol": refinement_tol,
+            "holonomy_correction": holonomy_correction,
+            "holonomy_max_iter": holonomy_max_iter,
+            "holonomy_tol": holonomy_tol,
+            "holonomy_min_plaquettes": holonomy_min_plaquettes,
+            "use_wfc_cache": use_wfc_cache,
+            "logger_name": logger_name,
+            "logger_level": logger_level,
+        }
+    )
 
     # Group consecutive zones by signature; same-signature zones have disjoint
     # k-point sets and may run in parallel.
@@ -387,7 +402,7 @@ def run_basis_rotation(
             zone_groups.append((sig, [(zi, zone)]))
 
     try:
-        _fork_ctx = mp.get_context('fork')
+        _fork_ctx = mp.get_context("fork")
     except ValueError:
         _fork_ctx = None
         if n_workers > 1:
@@ -403,15 +418,12 @@ def run_basis_rotation(
             _n_zones = len(_sig_zone_list)
             if _n_zones > 1 and n_workers > 1 and _fork_ctx is not None:
                 _n_pool = min(n_workers, _n_zones)
-                logger.info(
-                    f"\t  [Parallel zones] bands {sorted(_sig)}: "
-                    f"{_n_zones} zone(s) -> {_n_pool} worker(s)"
-                )
+                logger.info(f"\t  [Parallel zones] bands {sorted(_sig)}: {_n_zones} zone(s) -> {_n_pool} worker(s)")
                 # Split the RAM budget across the pool: each worker sizes its
                 # own wfc cache independently, and without a share they would
                 # all measure the same free memory and each claim it in full.
                 # Set before forking so children inherit the value.
-                _zone_ctx['mem_budget_bytes'] = _available_memory_bytes() // _n_pool
+                _zone_ctx["mem_budget_bytes"] = _available_memory_bytes() // _n_pool
                 _args = [(_zi, _sig, _zone) for _zi, _zone in _sig_zone_list]
                 with ProcessPoolExecutor(max_workers=_n_pool, mp_context=_fork_ctx) as _ex:
                     for _zone_rows in _ex.map(_process_zone_worker, _args):
@@ -419,10 +431,18 @@ def run_basis_rotation(
             else:
                 for _zi, _zone in _sig_zone_list:
                     _rows = _process_zone(
-                        zi=_zi, sig=_sig, zone=_zone,
-                        d_phase=d_phase, eigenvalues=eigenvalues, neighbors=neighbors,
-                        noncolin=m.noncolin, wfcdir=m.wfcdirectory, nr=m.nr,
-                        n_dir=2 * m.dimensions, compress=compress, ethr=ethr,
+                        zi=_zi,
+                        sig=_sig,
+                        zone=_zone,
+                        d_phase=d_phase,
+                        eigenvalues=eigenvalues,
+                        neighbors=neighbors,
+                        noncolin=m.noncolin,
+                        wfcdir=m.wfcdirectory,
+                        nr=m.nr,
+                        n_dir=2 * m.dimensions,
+                        compress=compress,
+                        ethr=ethr,
                         max_refinement_iter=max_refinement_iter,
                         refinement_iter_cap=refinement_iter_cap,
                         refinement_anderson_m=refinement_anderson_m,
@@ -465,7 +485,7 @@ def run_basis_rotation(
 
     # Save basisrotation_zones.npy -- each row: [zone_id, b1 ... bN (-1 padded), k-point]
     if summary_rows:
-        max_n   = max(len(bands) for _, bands, *_ in summary_rows)
+        max_n = max(len(bands) for _, bands, *_ in summary_rows)
         records = []
         for zi, bands, _, _, _, _, _, _, zone_set, *_ in summary_rows:
             bs = list(bands) + [-1] * (max_n - len(bands))

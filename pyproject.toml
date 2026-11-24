@@ -12,9 +12,10 @@ authors = [
     { name = "Berry Developers", email = "ricardo.ribeiro@physics.org" },
     { name = "Rafael Sucena", email = "rafael.sucena.academic@gmail.com" },
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "numpy>=1.22",
+    "torch>=2.0",
     "scipy>=1.9.3",
     "matplotlib>=3.6",
     "numba>=0.56.4",
@@ -26,9 +27,7 @@ dependencies = [
     "threadpoolctl>=3.0.0",
 ]
 classifiers = [
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Physics",
     "Operating System :: POSIX :: Linux",
@@ -82,5 +81,6 @@ python_functions = ["test_*"]
 source = ["berry"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.14"
 ignore_missing_imports = true
+exclude = ["^berry/berry_geometry_np\\.py$"]

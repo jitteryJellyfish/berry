@@ -1,14 +1,17 @@
-import os
-from time import time
 import logging
+import os
 import threading
 from math import prod
+from time import time
+from typing import Any
 
 import numpy as np
 from findiff import Gradient
 
 from berry import log
 from berry.shg import load_berry_connections
+
+logger: Any = None
 
 try:
     import berry._subroutines.loaddata as d
@@ -18,7 +21,7 @@ except:
 
 
 def deriv(berryConnection, s, sprime, alpha1, alpha2, dk):
-    """ Derivative of the Berry connection."""
+    """Derivative of the Berry connection."""
     if m.dimensions == 1:
         grad = Gradient(h=[dk], acc=4)  # Defines gradient function in 1D
     elif m.dimensions == 2:
@@ -30,11 +33,12 @@ def deriv(berryConnection, s, sprime, alpha1, alpha2, dk):
 
     return a[alpha2]
 
+
 def loadz(pathz, path, mmap_mode=None):
-    if os.path.exists(pathz): # reading .npz compressed file if exists
+    if os.path.exists(pathz):  # reading .npz compressed file if exists
         r = np.load(pathz, mmap_mode=mmap_mode)
-        r = r['arr_0']
-    else: # otherwise read .npy file
+        r = r["arr_0"]
+    else:  # otherwise read .npy file
         r = np.load(path, mmap_mode=mmap_mode)
 
     return r
@@ -46,13 +50,10 @@ def _load_chern_pos(idx: int):
     components (wfcpos{idx}-0, wfcpos{idx}-1) are stacked along axis 0, so
     np.sum(pos[:, a].conj() * pos[:, b]) sums over both components."""
     if m.noncolin:
-        p0 = loadz(os.path.join(m.data_dir, f"wfcpos{idx}-0.npz"),
-                   os.path.join(m.data_dir, f"wfcpos{idx}-0.npy"))
-        p1 = loadz(os.path.join(m.data_dir, f"wfcpos{idx}-1.npz"),
-                   os.path.join(m.data_dir, f"wfcpos{idx}-1.npy"))
+        p0 = loadz(os.path.join(m.data_dir, f"wfcpos{idx}-0.npz"), os.path.join(m.data_dir, f"wfcpos{idx}-0.npy"))
+        p1 = loadz(os.path.join(m.data_dir, f"wfcpos{idx}-1.npz"), os.path.join(m.data_dir, f"wfcpos{idx}-1.npy"))
         return np.concatenate((p0, p1), axis=0)
-    return loadz(os.path.join(m.data_dir, f"wfcpos{idx}.npz"),
-                 os.path.join(m.data_dir, f"wfcpos{idx}.npy"))
+    return loadz(os.path.join(m.data_dir, f"wfcpos{idx}.npz"), os.path.join(m.data_dir, f"wfcpos{idx}.npy"))
 
 
 ###############################################################################
@@ -68,6 +69,7 @@ def _load_chern_pos(idx: int):
 # fly to each tile: it acts only along the k axes, so tiling nr does not
 # change it.
 ###############################################################################
+
 
 def _kshape():
     if m.dimensions == 1:
@@ -98,8 +100,9 @@ def _parse_props(prop) -> set:
         elif token in valid:
             props.add(token)
         elif token:
-            raise ValueError(f"invalid property {token!r}; choose from "
-                             f"{sorted(valid)} or the aliases 'chern_all', 'all'")
+            raise ValueError(
+                f"invalid property {token!r}; choose from {sorted(valid)} or the aliases 'chern_all', 'all'"
+            )
     if not props:
         raise ValueError("no property requested")
     return props
@@ -110,11 +113,11 @@ def _geometry_files_complete(bands, kind: str, logger) -> bool:
     m.geometry_dir for every pair of the requested bands (existence only; no
     shape or staleness check)."""
     prefix = {"conn": "berryConn", "curv": "berryCur"}[kind]
-    missing = sum(1 for a in bands for b in bands
-                  if not os.path.exists(os.path.join(m.geometry_dir, f"{prefix}{a}_{b}.npy")))
+    missing = sum(
+        1 for a in bands for b in bands if not os.path.exists(os.path.join(m.geometry_dir, f"{prefix}{a}_{b}.npy"))
+    )
     if missing:
-        logger.debug(f"\t{missing} of {len(bands)**2} {prefix} files missing "
-                     f"for bands {bands[0]}-{bands[-1]}")
+        logger.debug(f"\t{missing} of {len(bands) ** 2} {prefix} files missing for bands {bands[0]}-{bands[-1]}")
     return missing == 0
 
 
@@ -142,7 +145,7 @@ def _pread_exact(fd: int, buf, offset: int) -> None:
     while done < total:
         got = os.preadv(fd, [view[done:]], offset + done)
         if got <= 0:
-            raise IOError(f"short read (fd {fd}, offset {offset + done})")
+            raise OSError(f"short read (fd {fd}, offset {offset + done})")
         done += got
 
 
@@ -167,14 +170,13 @@ class _PosStream:
         # validate the files and record data offsets
         pos_shape = (m.nr,) + self.kshape
         self.handles = []  # per component: list of (fd, data_offset)
-        for comp in (range(2) if m.noncolin else (None,)):
+        for comp in range(2) if m.noncolin else (None,):
             comp_handles = []
             for band in bands:
                 path = _pos_file(band, comp)
                 mm = np.lib.format.open_memmap(path, mode="r")
                 if mm.shape != pos_shape or mm.dtype != np.complex128:
-                    raise RuntimeError(f"{path}: expected {pos_shape} complex128, "
-                                       f"got {mm.shape} {mm.dtype}")
+                    raise RuntimeError(f"{path}: expected {pos_shape} complex128, got {mm.shape} {mm.dtype}")
                 offset = mm.offset
                 del mm
                 comp_handles.append((os.open(path, os.O_RDONLY), offset))
@@ -188,8 +190,7 @@ class _PosStream:
         self.n_tiles = -(-m.nr // self.tile)
 
         # ping-pong buffers so each tile read reuses memory
-        self._bufs = [np.empty((self.ncomp, self.K, N, self.tile), np.complex128)
-                      for _ in range(2)]
+        self._bufs = [np.empty((self.ncomp, self.K, N, self.tile), np.complex128) for _ in range(2)]
         self._staging = np.empty((self.tile, self.K), np.complex128)
 
     def _read_tile(self, i_tile: int):
@@ -277,11 +278,13 @@ def _broken_kpoint_masks(bands, enabled: bool, logger):
     if not enabled:
         return {}
     try:
-        flag = np.load(os.path.join(m.data_dir, "dp_interp_mask.npy"))    # (nks,nslots) bool
-        nktoijl = np.asarray(d.nktoijl)                                   # (nks,>=dim)
+        flag = np.load(os.path.join(m.data_dir, "dp_interp_mask.npy"))  # (nks,nslots) bool
+        nktoijl = np.asarray(d.nktoijl)  # (nks,>=dim)
     except Exception as exc:
-        logger.warning(f"\tSeam regularization skipped (missing dp_interp_mask.npy -- "
-                       f"re-run the clustering step to regenerate it: {exc})")
+        logger.warning(
+            f"\tSeam regularization skipped (missing dp_interp_mask.npy -- "
+            f"re-run the clustering step to regenerate it: {exc})"
+        )
         return {}
     nks = flag.shape[0]
     kshape = _kshape()
@@ -304,10 +307,14 @@ def _broken_kpoint_masks(bands, enabled: bool, logger):
         masks[a] = mask
         total_flagged += int(mask.sum())
         if mask.any():
-            logger.info(f"\t  band {a}: {int(mask.sum())} dp-broken seam k-point(s) "
-                        f"({100 * mask.sum() / nks:.2f}%) flagged for regularization")
-    logger.info(f"\tSeam regularization: {total_flagged} signalled (band, k) cell(s) "
-                f"interpolated across bands {bands[0]}-{bands[-1]}")
+            logger.info(
+                f"\t  band {a}: {int(mask.sum())} dp-broken seam k-point(s) "
+                f"({100 * mask.sum() / nks:.2f}%) flagged for regularization"
+            )
+    logger.info(
+        f"\tSeam regularization: {total_flagged} signalled (band, k) cell(s) "
+        f"interpolated across bands {bands[0]}-{bands[-1]}"
+    )
     return masks
 
 
@@ -323,8 +330,8 @@ def _inpaint_periodic(arr: np.ndarray, mask: np.ndarray, max_iter: int = 16) -> 
         return arr
     kdim = mask.ndim
     ksh = mask.shape
-    lead = arr.shape[:arr.ndim - kdim]
-    a = arr.reshape((-1,) + ksh).astype(arr.dtype, copy=True)   # (L, *ksh)
+    lead = arr.shape[: arr.ndim - kdim]
+    a = arr.reshape((-1,) + ksh).astype(arr.dtype, copy=True)  # (L, *ksh)
     known = ~mask
     for _ in range(max_iter):
         todo = mask & ~known
@@ -334,7 +341,7 @@ def _inpaint_periodic(arr: np.ndarray, mask: np.ndarray, max_iter: int = 16) -> 
         den = np.zeros(ksh, dtype=float)
         for ax in range(kdim):
             for sh in (1, -1):
-                kn = np.roll(known, sh, axis=ax)               # neighbour currently known?
+                kn = np.roll(known, sh, axis=ax)  # neighbour currently known?
                 num += np.roll(a, sh, axis=ax + 1) * kn[None]  # +1: skip the L axis
                 den += kn
         fill = todo & (den > 0)
@@ -347,9 +354,9 @@ def _inpaint_periodic(arr: np.ndarray, mask: np.ndarray, max_iter: int = 16) -> 
     return a.reshape(lead + ksh)
 
 
-def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
-                                 mem_gb: float, logger,
-                                 regularize: bool = True) -> None:
+def _stream_connection_curvature(
+    bands, do_conn: bool, do_curv: bool, mem_gb: float, logger, regularize: bool = True
+) -> None:
     """One pass over the wfcpos files; writes all berryConn / berryCur pairs.
 
     ``regularize`` interpolates the connection/curvature over the
@@ -363,8 +370,9 @@ def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
     D = m.dimensions
 
     stream = _PosStream(bands, mem_gb, logger)
-    logger.info(f"\tStreaming {stream.n_tiles} tile(s) of {stream.tile} r-points, "
-                f"{N} bands, {stream.ncomp} spinor component(s)")
+    logger.info(
+        f"\tStreaming {stream.n_tiles} tile(s) of {stream.tile} r-points, {N} bands, {stream.ncomp} spinor component(s)"
+    )
 
     # accumulators are k-mesh sized only
     acc_conn = np.zeros((D, K, N, N), np.complex128) if do_conn else None
@@ -380,10 +388,10 @@ def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
         t_read += time() - t0
         t0 = time()
         for pos in comps:  # one pass per spinor component, contributions add
-            gra = _tile_gradient(pos, kshape)              # (D, K, N, t)
+            gra = _tile_gradient(pos, kshape)  # (D, K, N, t)
             if do_conn:
                 # acc[d,k] += P_k^H (G_d)_k^T: batched (N,t)@(t,N) over k
-                Pc = pos.conj()                            # (K, N, t)
+                Pc = pos.conj()  # (K, N, t)
                 for dd in range(D):
                     acc_conn[dd] += Pc @ gra[dd].transpose(0, 2, 1)
             if curv_pairs:
@@ -403,7 +411,8 @@ def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
     masks = _broken_kpoint_masks(bands, regularize, logger) if (do_conn or do_curv) else {}
 
     def _pair_mask(a, b):
-        ma = masks.get(bands[a]); mb = masks.get(bands[b])
+        ma = masks.get(bands[a])
+        mb = masks.get(bands[b])
         if ma is None and mb is None:
             return None
         if ma is None:
@@ -415,29 +424,34 @@ def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
     if do_conn:
         ##  normalization convention: (1/nr) * sum_r |u|^2 = 1
         ##  (the .wfc files hold the periodic parts u_nk)
-        conn = 1j * acc_conn.transpose(2, 3, 0, 1) / m.nr        # (N,N,D,K)
+        conn = 1j * acc_conn.transpose(2, 3, 0, 1) / m.nr  # (N,N,D,K)
         # A is Hermitian in the band indices up to FD truncation and gauge
         # quality; the residual is a free diagnostic of both
         res = np.abs(conn - conn.conj().transpose(1, 0, 2, 3))
         worst = np.unravel_index(np.argmax(res), res.shape)
-        logger.info(f"\tHermiticity residual max |A_ab - A_ba*| = {res.max():.3e} "
-                    f"(pair {bands[worst[0]]},{bands[worst[1]]}; "
-                    f"large values flag bad gauge/attribution k-points)")
+        logger.info(
+            f"\tHermiticity residual max |A_ab - A_ba*| = {res.max():.3e} "
+            f"(pair {bands[worst[0]]},{bands[worst[1]]}; "
+            f"large values flag bad gauge/attribution k-points)"
+        )
         for a in range(N):
             for b in range(N):
                 arr = conn[a, b].reshape((D,) + kshape)
                 arr = _inpaint_periodic(arr, _pair_mask(a, b))
                 np.save(os.path.join(m.geometry_dir, f"berryConn{bands[a]}_{bands[b]}.npy"), arr)
-        logger.info(f"\tberryConn files written for bands {bands[0]}-{bands[-1]}"
-                    + (" (seam-regularized)" if masks else ""))
+        logger.info(
+            f"\tberryConn files written for bands {bands[0]}-{bands[-1]}" + (" (seam-regularized)" if masks else "")
+        )
 
     if do_curv:
+
         def kernel(M_ddp):  # 1j*(M[d,d'] - M[d',d]) / nr, M[d',d] from the identity
             return 1j * (M_ddp - M_ddp.conj().transpose(0, 2, 1)) / m.nr
+
         if D == 2:
-            comps_std = [kernel(acc_M[(0, 1)])]                  # Omega_z
+            comps_std = [kernel(acc_M[(0, 1)])]  # Omega_z
         else:
-            comps_std = [kernel(acc_M[dd]) for dd in curv_pairs] # Omega_x,y,z
+            comps_std = [kernel(acc_M[dd]) for dd in curv_pairs]  # Omega_x,y,z
         # standard sign convention Omega = +curl(A): the kernels
         # above carry the old orientation; -conj converts, as before
         for a in range(N):
@@ -448,8 +462,9 @@ def _stream_connection_curvature(bands, do_conn: bool, do_curv: bool,
                     bcr = -np.conj(np.stack([c[:, a, b] for c in comps_std])).reshape((3,) + kshape)
                 bcr = _inpaint_periodic(bcr, _pair_mask(a, b))
                 np.save(os.path.join(m.geometry_dir, f"berryCur{bands[a]}_{bands[b]}.npy"), bcr)
-        logger.info(f"\tberryCur files written for bands {bands[0]}-{bands[-1]}"
-                    + (" (seam-regularized)" if masks else ""))
+        logger.info(
+            f"\tberryCur files written for bands {bands[0]}-{bands[-1]}" + (" (seam-regularized)" if masks else "")
+        )
 
 
 def chern_number(curv):
@@ -473,11 +488,12 @@ def chern_number(curv):
             curv = curv[0]
         return np.sum(curv) * m.step**2 / (2 * np.pi)
     # 3D: per-slice average of the flux of each curvature component
-    if curv.ndim == 5:      # legacy file: components duplicated into (3, 3, ...)
+    if curv.ndim == 5:  # legacy file: components duplicated into (3, 3, ...)
         curv = curv[:, 0]
-    return np.array([np.sum(curv[0]) * m.step**2 / m.nkx,
-                     np.sum(curv[1]) * m.step**2 / m.nky,
-                     np.sum(curv[2]) * m.step**2 / m.nkz]) / (2 * np.pi)
+    return np.array(
+        [np.sum(curv[0]) * m.step**2 / m.nkx, np.sum(curv[1]) * m.step**2 / m.nky, np.sum(curv[2]) * m.step**2 / m.nkz]
+    ) / (2 * np.pi)
+
 
 def berry_phase(pos, x, y):
     """Gauge-invariant Berry phase of the counterclockwise plaquette at (x, y),
@@ -486,14 +502,17 @@ def berry_phase(pos, x, y):
     The discrete link <u_k|u_{k+dk}> has angle -A.dk (since <u|du> = -iA with
     A = i<u|grad u>), so the counterclockwise product of these links gives
     -flux; the minus sign restores the standard orientation."""
-    bp = (np.sum(pos[:, x, y].conj()     * pos[:, x+1, y])
-       *  np.sum(pos[:, x+1, y].conj()   * pos[:, x+1, y+1])
-       *  np.sum(pos[:, x+1, y+1].conj() * pos[:, x, y+1])
-       *  np.sum(pos[:, x, y+1].conj()   * pos[:, x, y])) / (m.nr ** 4)
+    bp = (
+        np.sum(pos[:, x, y].conj() * pos[:, x + 1, y])
+        * np.sum(pos[:, x + 1, y].conj() * pos[:, x + 1, y + 1])
+        * np.sum(pos[:, x + 1, y + 1].conj() * pos[:, x, y + 1])
+        * np.sum(pos[:, x, y + 1].conj() * pos[:, x, y])
+    ) / (m.nr**4)
 
     bp = -np.angle(bp)
 
     return bp
+
 
 def chern_number_bp(pos) -> np.complex128:
     """Fukui-Hatsugai-Suzuki lattice Chern number: sum of plaquette Berry
@@ -503,14 +522,15 @@ def chern_number_bp(pos) -> np.complex128:
     mesh tiles the closed BZ torus (for a partial patch it is the patch flux)."""
     chern = 0
     if m.dimensions == 2:
-        for i in range(m.nkx -1):
-            for j in range(m.nky -1):
+        for i in range(m.nkx - 1):
+            for j in range(m.nky - 1):
                 chern += berry_phase(pos, i, j)
-        chern /= (2*np.pi)
+        chern /= 2 * np.pi
     else:
         logger.warning("\tchern_bp is only implemented for 2D materials; returning 0.")
 
     return chern
+
 
 def chern_number_bp_bz(pos) -> np.complex128:
     """Berry phase of the counterclockwise Wilson loop around the mesh
@@ -522,18 +542,20 @@ def chern_number_bp_bz(pos) -> np.complex128:
     underflow of a long product of |overlap|<1 factors is gone."""
     chern = 0.0
     if m.dimensions == 2:
+
         def _link(z):
             return z / abs(z)
+
         prod_ = 1.0 + 0.0j
-        for i in range(m.nkx-1):
-            prod_ *= _link(np.sum(pos[:, i, 0].conj() * pos[:, i+1, 0]))
-            prod_ *= _link(np.sum(pos[:, i, m.nky-1] * pos[:, i+1, m.nky-1].conj()))
-        for j in range(m.nky-1):
-            prod_ *= _link(np.sum(pos[:, m.nkx-1, j].conj() * pos[:, m.nkx-1, j+1]))
-            prod_ *= _link(np.sum(pos[:, 0, j] * pos[:, 0, j+1].conj()))
+        for i in range(m.nkx - 1):
+            prod_ *= _link(np.sum(pos[:, i, 0].conj() * pos[:, i + 1, 0]))
+            prod_ *= _link(np.sum(pos[:, i, m.nky - 1] * pos[:, i + 1, m.nky - 1].conj()))
+        for j in range(m.nky - 1):
+            prod_ *= _link(np.sum(pos[:, m.nkx - 1, j].conj() * pos[:, m.nkx - 1, j + 1]))
+            prod_ *= _link(np.sum(pos[:, 0, j] * pos[:, 0, j + 1].conj()))
         # links <u_k|u_next> carry angle -A.dk (see berry_phase): negate for
         # the standard orientation
-        chern = -np.angle(prod_) / (2*np.pi)
+        chern = -np.angle(prod_) / (2 * np.pi)
     else:
         logger.warning("\tchern_bp_bz is only implemented for 2D materials; returning 0.")
 
@@ -556,33 +578,31 @@ def berry_curvature_curl(idx: int, idx_: int, berry_connection, offset: int = 0)
 
     # deriv(bc, s, s', alpha1, alpha2, dk) = d_{alpha2} A_{alpha1}, so the curl
     # Omega_c = d_a A_b - d_b A_a is deriv(..., b, a, ...) - deriv(..., a, b, ...).
-    if m.dimensions == 2:                # 2D case
+    if m.dimensions == 2:  # 2D case
+
         def aux_curvature() -> np.ndarray:
             """
             Auxiliary function to calculate the Berry curvature.
             Attention: this is valid for 2D and 3D materials.
             """
 
-            bcr = (deriv(berry_connection, s, s_, 1, 0, m.step)
-                   - deriv(berry_connection, s, s_, 0, 1, m.step))
+            bcr = deriv(berry_connection, s, s_, 1, 0, m.step) - deriv(berry_connection, s, s_, 0, 1, m.step)
 
             return bcr
 
-    else:                                # 3D case
+    else:  # 3D case
+
         def aux_curvature():
             """
             Auxiliary function to calculate the Berry curvature.
             Attention: this is valid for 2D and 3D materials.
             """
 
-            bcr0 = (deriv(berry_connection, s, s_, 2, 1, m.step)
-                    - deriv(berry_connection, s, s_, 1, 2, m.step))
+            bcr0 = deriv(berry_connection, s, s_, 2, 1, m.step) - deriv(berry_connection, s, s_, 1, 2, m.step)
 
-            bcr1 = (deriv(berry_connection, s, s_, 0, 2, m.step)
-                    - deriv(berry_connection, s, s_, 2, 0, m.step))
+            bcr1 = deriv(berry_connection, s, s_, 0, 2, m.step) - deriv(berry_connection, s, s_, 2, 0, m.step)
 
-            bcr2 = (deriv(berry_connection, s, s_, 1, 0, m.step)
-                    - deriv(berry_connection, s, s_, 0, 1, m.step))
+            bcr2 = deriv(berry_connection, s, s_, 1, 0, m.step) - deriv(berry_connection, s, s_, 0, 1, m.step)
 
             return bcr0, bcr1, bcr2
 
@@ -596,7 +616,19 @@ def berry_curvature_curl(idx: int, idx_: int, berry_connection, offset: int = 0)
     return bcr
 
 
-def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str = "both", digits: int = 0, mem_gb: float = 32.0, regularize: bool = True, force: bool = False, logger_name: str = "geometry", logger_level: int = logging.INFO, flush: bool = False):
+def run_berry_geometry(
+    max_band: int,
+    min_band: int = 0,
+    npr: int = 0,
+    prop: str = "both",
+    digits: int = 0,
+    mem_gb: float = 32.0,
+    regularize: bool = True,
+    force: bool = False,
+    logger_name: str = "geometry",
+    logger_level: int = logging.INFO,
+    flush: bool = False,
+):
     """``prop`` is a token or comma-separated list among 'both', 'conn', 'curv',
     'chern', 'chern_curl', 'chern_bp', 'chern_bp_bz', plus the aliases
     'chern_all' (the four Chern methods) and 'all' (everything).  The
@@ -633,7 +665,7 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
     want_conn = bool(props & {"both", "conn"})
     want_curv = bool(props & {"both", "curv"}) and m.dimensions > 1
     if props & {"both", "curv"} and m.dimensions == 1:
-        logger.info(f"\tBerry curvature is not defined for 1D materials.")
+        logger.info("\tBerry curvature is not defined for 1D materials.")
 
     conn_done = _geometry_files_complete(bands, "conn", logger)
     curv_done = _geometry_files_complete(bands, "curv", logger)
@@ -644,22 +676,24 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
     do_conn = need_conn or (want_conn and (force or not conn_done))
     do_curv = need_curv or (want_curv and (force or not curv_done))
     if want_conn and not do_conn:
-        logger.info(f"\tberryConn files for bands {bands[0]}-{bands[-1]} already "
-                    f"present; skipping (use -force to recompute)")
+        logger.info(
+            f"\tberryConn files for bands {bands[0]}-{bands[-1]} already present; skipping (use -force to recompute)"
+        )
     if want_curv and not do_curv:
-        logger.info(f"\tberryCur files for bands {bands[0]}-{bands[-1]} already "
-                    f"present; skipping (use -force to recompute)")
+        logger.info(
+            f"\tberryCur files for bands {bands[0]}-{bands[-1]} already present; skipping (use -force to recompute)"
+        )
 
     if do_conn or do_curv:
         try:
             from threadpoolctl import threadpool_limits
         except ImportError:
             from contextlib import nullcontext
+
             threadpool_limits = lambda limits: nullcontext()
         start = time()
         with threadpool_limits(limits=npr):
-            _stream_connection_curvature(bands, do_conn, do_curv, mem_gb, logger,
-                                         regularize=regularize)
+            _stream_connection_curvature(bands, do_conn, do_curv, mem_gb, logger, regularize=regularize)
         logger.info(f"\tconnection/curvature pass took {time() - start:.2f} seconds")
 
     def _new_chern_array():
@@ -670,9 +704,9 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
 
     def _log_chern_numbers(method, values):
         logger.info(f"\n\t{method}:")
-        logger.info(f"{'Band:' : >13} Chern Number")
+        logger.info(f"{'Band:': >13} Chern Number")
         for idx in bands:
-            logger.info(f"{f'{idx}:' : >13} {values[idx]}")
+            logger.info(f"{f'{idx}:': >13} {values[idx]}")
 
     if m.dimensions > 1:
         if "chern" in props:
@@ -684,24 +718,24 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
             # save the chern number
             chern_num = np.round(np.real(chern_num), decimals=digits)
             np.save(os.path.join(m.geometry_dir, "chern_number.npy"), chern_num)
-            logger.info(f"\tchern_number.npy saved")
+            logger.info("\tchern_number.npy saved")
             _log_chern_numbers("chern", chern_num)
 
         if "chern_curl" in props:
             chern_num = _new_chern_array()
             number_of_bands = max_band + 1 - min_band
             if m.dimensions == 2:
-                berry_conn_size  = m.dimensions * m.nkx * m.nky * (number_of_bands) ** 2
+                berry_conn_size = m.dimensions * m.nkx * m.nky * (number_of_bands) ** 2
                 berry_conn_shape = (number_of_bands, number_of_bands, m.dimensions, m.nkx, m.nky)
             else:
-                berry_conn_size  = m.dimensions * m.nkx * m.nky * m.nkz * (number_of_bands) ** 2
+                berry_conn_size = m.dimensions * m.nkx * m.nky * m.nkz * (number_of_bands) ** 2
                 berry_conn_shape = (number_of_bands, number_of_bands, m.dimensions, m.nkx, m.nky, m.nkz)
             berry_connections = load_berry_connections(min_band, max_band, berry_conn_size, berry_conn_shape)
             for idx in bands:
                 curv = berry_curvature_curl(idx, idx, berry_connections, offset=min_band)
                 chern_num[idx] = chern_number(curv)
             np.save(os.path.join(m.geometry_dir, "chern_number_curl.npy"), chern_num)
-            logger.info(f"\tchern_number_curl.npy saved")
+            logger.info("\tchern_number_curl.npy saved")
             _log_chern_numbers("chern_curl", np.real(chern_num))
 
         if props & {"chern_bp", "chern_bp_bz"}:
@@ -716,11 +750,11 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
                     chern_bz_num[idx] = chern_number_bp_bz(pos)
             if chern_bp_num is not None:
                 np.save(os.path.join(m.geometry_dir, "chern_number_bp.npy"), chern_bp_num)
-                logger.info(f"\tchern_number_bp.npy saved")
+                logger.info("\tchern_number_bp.npy saved")
                 _log_chern_numbers("chern_bp", np.real(chern_bp_num))
             if chern_bz_num is not None:
                 np.save(os.path.join(m.geometry_dir, "chern_number_bp_bz.npy"), chern_bz_num)
-                logger.info(f"\tchern_number_bp_bz.npy saved")
+                logger.info("\tchern_number_bp_bz.npy saved")
                 _log_chern_numbers("chern_bp_bz", np.real(chern_bz_num))
 
     ###########################################################################
@@ -728,6 +762,7 @@ def run_berry_geometry(max_band: int, min_band: int = 0, npr: int = 0, prop: str
     ###########################################################################
 
     logger.footer()
+
 
 if __name__ == "__main__":
     run_berry_geometry(9, prop="both")

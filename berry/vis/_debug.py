@@ -1,23 +1,26 @@
-from colorama import Fore, Back, Style
-
 import numpy as np
+from colorama import Back
+from colorama import Fore
+from colorama import Style
 
-from berry._subroutines.write_k_points import _float_numbers1, _float_numbers2, _float_numbers3
-import berry._subroutines.loadmeta as m
 import berry._subroutines.loaddata as d
-
+import berry._subroutines.loadmeta as m
+from berry._subroutines.write_k_points import _float_numbers1
+from berry._subroutines.write_k_points import _float_numbers2
+from berry._subroutines.write_k_points import _float_numbers3
 
 Options = str
 
+
 def log_data():
-    print("#"*100)
+    print("#" * 100)
     print("# DATA OF THE SYSTEM")
-    print("#"*100)
+    print("#" * 100)
     print(f"\tVersion of berry where data was created            {m.version}")
     print(f"\tUnique reference for the run                       {m.refname}\n")
 
     print(f"\tNumber of dimensions                               {m.dimensions}\n")
-    
+
     print(f"\tInitial k-point                                    {m.k0}")
     print(f"\tNumber of k-points in the x direction              {m.nkx}")
     print(f"\tNumber of k-points in the y direction              {m.nky}")
@@ -68,29 +71,26 @@ def log_data():
 
     print(f"\tDirectory for DFT saved files                      {m.outdir}")
     print(f"\tPath to DFT file with data of the run              {m.dftdatafile}")
-    
+
     print(f"\tFile for extracting DFT wfc to real space          {m.wfck2r}\n")
-    
-    
 
 
 def log_dot1():
 
     initial_band = m.initial_band if m.initial_band != "dummy" else 0
 
-    print("#"*100)
+    print("#" * 100)
     print("# DOT PRODUCT OF THE WAVEFUNCTIONS (option 1)")
-    print("#"*100)
+    print("#" * 100)
     print(f"\n\tDirectory where the wfc are: {m.wfcdirectory}")
     print(f"\tNumber of k-points in each direction: {m.nkx}, {m.nky}, {m.nkz}")
     print(f"\tTotal number of k-points: {m.nks}")
     print(f"\tInitial band: {initial_band}")
-    print(f"\tFinal band: {m.nbnd-1}")
-    print(f"\tNumber of bands: {m.nbnd-initial_band}\n")
-
+    print(f"\tFinal band: {m.nbnd - 1}")
+    print(f"\tNumber of bands: {m.nbnd - initial_band}\n")
 
     try:
-        connections = np.load(m.data_dir+"/dp.npy")
+        connections = np.load(m.data_dir + "/dp.npy")
     except FileNotFoundError:
         raise FileNotFoundError("File dp.npy not found. Run the script dotproduct.py to create it.")
 
@@ -100,24 +100,20 @@ def log_dot1():
         for j in range(4):
             neighbor = d.neighbors[nk, j]
             print(f"\t{nk=}; {neighbor=}")
-            for band in range(m.nbnd-initial_band):
+            for band in range(m.nbnd - initial_band):
                 line = "  "
-                for band1 in range(m.nbnd-initial_band):
+                for band1 in range(m.nbnd - initial_band):
                     if connections[nk, j, band, band1] > 0.1:
-                        line = (
-                            line
-                            + "{:0.1f}".format(connections[nk, j, band, band1])
-                            + " "
-                        )
+                        line = line + f"{connections[nk, j, band, band1]:0.1f}" + " "
                     else:
                         line = line + "    "
                 print(line)
 
 
 def log_dot2(band1: int):
-    print("#"*100)
+    print("#" * 100)
     print("# DOT PRODUCT OF THE WAVEFUNCTIONS (option 2)")
-    print("#"*100)
+    print("#" * 100)
 
     print("     Directory where the wfc are:", m.wfcdirectory)
     print("     Number of k-points in each direction:", m.nkx, m.nky, m.nkz)
@@ -245,9 +241,9 @@ def log_dot2(band1: int):
 
 
 def log_eigen(band: int, acc: int):
-    print("#"*100)
+    print("#" * 100)
     print("# EIGENVALUES")
-    print("#"*100)
+    print("#" * 100)
     if acc == 0:
         acc = 4
     if m.dimensions == 1:
@@ -259,26 +255,26 @@ def log_eigen(band: int, acc: int):
 
 
 def log_neighbors():
-    print("#"*100)
+    print("#" * 100)
     print("# NEIGHBORS")
-    print("#"*100)
+    print("#" * 100)
     m_ = np.max(d.neighbors)
     for nk in range(m.nks):
         print(f"{nk:5}:\t{d.neighbors[nk, 0]:5} {d.neighbors[nk, 1]:5} {d.neighbors[nk, 1]:5} {d.neighbors[nk, 3]:5}")
 
 
 def log_occupation():
-    print("#"*100)
+    print("#" * 100)
     print("# OCCUPATION")
-    print("#"*100)
+    print("#" * 100)
     for nk in range(m.nks):
         print(nk, d.occupations[nk, :])
 
 
 def log_r_space():
-    print("#"*100)
+    print("#" * 100)
     print("# R-SPACE")
-    print("#"*100)
+    print("#" * 100)
     for i in range(m.nr):
         print(i, d.r[i, 0], d.r[i, 1], d.r[i, 2])
 
@@ -298,6 +294,7 @@ def debug(args):
         log_neighbors()
     elif args.debug_vis == "r-space":
         log_r_space()
+
 
 if __name__ == "__main__":
     debug()

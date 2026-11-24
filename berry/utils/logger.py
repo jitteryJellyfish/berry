@@ -1,22 +1,25 @@
+import logging
+import time
 from pathlib import Path
 
-import time
-import logging
-
 from berry import __version__
-from berry._subroutines.headerfooter import header, footer
 from berry._subroutines.contatempo import tempo
+from berry._subroutines.headerfooter import footer
+from berry._subroutines.headerfooter import header
+
 
 def prepare_message(method):
     def wrapper(ref, *messages):
-        message = ''
+        message = ""
         if len(messages) == 0:
             method(ref, message)
             return
         for m in messages:
-            message += str(m) + ' '
+            message += str(m) + " "
         method(ref, message)
+
     return wrapper
+
 
 class log:
     def __init__(self, program, title, level=logging.INFO, flush: bool = False):
@@ -27,22 +30,24 @@ class log:
         self.version = __version__
         self.level = level
         self.flush = flush
-        logging.basicConfig(filename='log/'+program+'.log',
-                            filemode='w',
-#                            encoding='utf-8',
-                            format='%(message)s',
-                            datefmt='%m/%d/%Y %H:%M:%S',
-                            level=level)
+        logging.basicConfig(
+            filename="log/" + program + ".log",
+            filemode="w",
+            #                            encoding='utf-8',
+            format="%(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=level,
+        )
         self.logger = logging.getLogger(program)
 
         self.STARTTIME = time.time()
-        self._progress = {}   # per-title state for percent_complete ETA logging
+        self._progress = {}  # per-title state for percent_complete ETA logging
 
         ch = logging.StreamHandler()
         ch.setLevel(logging.WARNING)
-        ch.setFormatter(logging.Formatter('%(message)s'))
+        ch.setFormatter(logging.Formatter("%(message)s"))
         self.logger.addHandler(ch)
-    
+
     def header(self):
         H = header(self.title, self.version, time.asctime())
         self.info(H)
@@ -70,14 +75,16 @@ class log:
         if self.flush:
             print(message, flush=True)
         self.logger.warning(message)
-    
+
     def footer(self):
         ENDTIME = time.time()
         F = footer(tempo(self.STARTTIME, ENDTIME))
         self.info(F)
 
-    def percent_complete(self, step, total_steps, bar_width=60, title="", print_perc=True, min_interval=10.0, min_percent_step=1.0):
-        '''
+    def percent_complete(
+        self, step, total_steps, bar_width=60, title="", print_perc=True, min_interval=10.0, min_percent_step=1.0
+    ):
+        """
         Log a progress line with elapsed time and an estimated time remaining (ETA),
         instead of drawing a terminal progress bar.
 
@@ -91,7 +98,7 @@ class log:
 
         `bar_width` and `print_perc` are accepted for call-site compatibility and are
         unused.
-        '''
+        """
         if total_steps is None or total_steps <= 0:
             return
 
@@ -102,20 +109,25 @@ class log:
             return f"{h:d}:{m:02d}:{s:02d}"
 
         now = time.time()
-        key = title or '_'
+        key = title or "_"
         state = self._progress.get(key)
         # (Re)start ETA tracking on a new title or when the counter restarts, but
         # PRESERVE the throttle state (last_emit, last_perc) across restarts.
         # Otherwise two progress sequences that share a title but run on different
         # step scales (e.g. a sub-loop counter vs. an outer one) reset each
         # other's timer on every call and flood the log, bypassing the rate limit.
-        if state is None or step < state['last_step']:
-            prev_emit = state['last_emit'] if state else None
-            prev_perc = state['last_perc'] if state else -1.0
-            state = {'start_time': now, 'start_step': step, 'last_emit': prev_emit,
-                     'last_perc': prev_perc, 'last_step': step}
+        if state is None or step < state["last_step"]:
+            prev_emit = state["last_emit"] if state else None
+            prev_perc = state["last_perc"] if state else -1.0
+            state = {
+                "start_time": now,
+                "start_step": step,
+                "last_emit": prev_emit,
+                "last_perc": prev_perc,
+                "last_step": step,
+            }
             self._progress[key] = state
-        state['last_step'] = step
+        state["last_step"] = step
 
         perc = min(100.0, 100.0 * float(step) / float(total_steps))
         is_last = step >= total_steps
@@ -123,16 +135,16 @@ class log:
         # min_interval seconds AND min_percent_step percent have passed since the
         # last emitted line. A step-based "first" bypass is deliberately NOT
         # used, so a counter restart cannot re-open the throttle.
-        if state['last_emit'] is not None and not is_last:
-            if now - state['last_emit'] < min_interval:
+        if state["last_emit"] is not None and not is_last:
+            if now - state["last_emit"] < min_interval:
                 return
-            if perc - state['last_perc'] < min_percent_step:
+            if perc - state["last_perc"] < min_percent_step:
                 return
-        state['last_emit'] = now
-        state['last_perc'] = perc
+        state["last_emit"] = now
+        state["last_perc"] = perc
 
-        elapsed = now - state['start_time']
-        done_since = step - state['start_step']
+        elapsed = now - state["start_time"]
+        done_since = step - state["start_step"]
         msg = f"{title + ': ' if title else ''}{perc:6.2f}% ({step}/{total_steps}) | elapsed {_fmt(elapsed)}"
         if is_last:
             msg += " | done"

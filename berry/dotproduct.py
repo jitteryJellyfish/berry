@@ -1,11 +1,9 @@
-from multiprocessing import Pool
-from typing import Tuple
-
-import os
-import json
-from time import time
 import ctypes
+import json
 import logging
+import os
+from multiprocessing import Pool
+from time import time
 
 import numpy as np
 
@@ -28,7 +26,7 @@ def _load_wfc(k: int, band: int, comp: str) -> np.ndarray:
     case, ``comp=""`` otherwise), transparently handling compressed .npz."""
     wfc = np.load(os.path.join(m.wfcdirectory, f"k0{k}b0{band}{comp}.wfc"))
     if isinstance(wfc, np.lib.npyio.NpzFile):  # compressed wfc
-        wfc = wfc['arr_0']
+        wfc = wfc["arr_0"]
     return wfc
 
 
@@ -59,17 +57,17 @@ def dot(nk: int, j: int, neighbor: int, jNeighbor: int) -> None:
     # Outer loop: block of reference (nk) bands, loaded once and reused against
     # every neighbor block.  Inner loop: block of neighbor bands, streamed.
     for i0 in range(0, nb, BAND_BLOCK):
-        ref_bands = BANDS[i0:i0 + BAND_BLOCK]
-        A = [_stack_block(nk, ref_bands, c) for c in COMPS]          # ncomp x (bi, nr)
+        ref_bands = BANDS[i0 : i0 + BAND_BLOCK]
+        A = [_stack_block(nk, ref_bands, c) for c in COMPS]  # ncomp x (bi, nr)
 
         for k0 in range(0, nb, BAND_BLOCK):
-            nbr_bands = BANDS[k0:k0 + BAND_BLOCK]
+            nbr_bands = BANDS[k0 : k0 + BAND_BLOCK]
 
             block = None
             for ci, c in enumerate(COMPS):
                 # neighbor block pre-conjugated: (bk, nr)
                 B = _stack_block(neighbor, nbr_bands, c).conj()
-                term = A[ci] @ B.T                                   # (bi, bk) BLAS gemm
+                term = A[ci] @ B.T  # (bi, bk) BLAS gemm
                 block = term if block is None else block + term
 
             b0, b1 = i0 + len(ref_bands), k0 + len(nbr_bands)
@@ -103,11 +101,12 @@ def _available_ram() -> int:
     """Bytes of currently-available physical RAM (0 if it cannot be queried)."""
     try:
         import psutil
+
         return int(psutil.virtual_memory().available)
     except Exception:
         try:  # POSIX fallback
             return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (ValueError, OSError, AttributeError):
+        except ValueError, OSError, AttributeError:
             return 0
 
 
@@ -118,7 +117,7 @@ def _auto_band_block(npr: int, bytes_per_band: int, nb: int) -> int:
     avail = _available_ram()
     if avail <= 0:
         return nb
-    budget = 0.4 * avail / max(npr, 1)            # 40% of the per-worker share
+    budget = 0.4 * avail / max(npr, 1)  # 40% of the per-worker share
     bs = int(budget // (2 * max(bytes_per_band, 1)))  # two blocks live at once
     return max(1, min(nb, bs))
 
@@ -131,7 +130,7 @@ def _fmt_hms(seconds: float) -> str:
     return f"{h:02d}:{minutes:02d}:{sec:02d}"
 
 
-def _dot_star(args: Tuple) -> int:
+def _dot_star(args: tuple) -> int:
     """Unpack the argument tuple for use with ``Pool.imap_unordered`` (which,
     unlike ``starmap``, passes a single argument) and return the task index so
     the parent can mark it done in the checkpoint mask."""
@@ -154,12 +153,14 @@ def _flush_logfile() -> None:
             pass
 
 
-def _ckpt_paths() -> Tuple[str, str, str]:
+def _ckpt_paths() -> tuple[str, str, str]:
     """Paths of the three checkpoint files, alongside the final dpc.npy."""
     base = m.data_dir
-    return (os.path.join(base, "dpc.ckpt.npy"),
-            os.path.join(base, "dpc.ckpt.mask.npy"),
-            os.path.join(base, "dpc.ckpt.meta.json"))
+    return (
+        os.path.join(base, "dpc.ckpt.npy"),
+        os.path.join(base, "dpc.ckpt.mask.npy"),
+        os.path.join(base, "dpc.ckpt.meta.json"),
+    )
 
 
 def _save_mask(path: str, done: np.ndarray) -> None:
@@ -179,7 +180,15 @@ def _cleanup_ckpt(*paths: str) -> None:
             except OSError:
                 pass
 
-def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logging.INFO, compress: bool = False, flush: bool = False, band_block: int = 0):
+
+def run_dot(
+    npr: int = 1,
+    logger_name: str = "dot",
+    logger_level: logging = logging.INFO,
+    compress: bool = False,
+    flush: bool = False,
+    band_block: int = 0,
+):
     global dpc, logger, BANDS, COMPS, BAND_BLOCK
     logger = log(logger_name, "DOT PRODUCT", level=logger_level, flush=flush)
 
@@ -187,7 +196,6 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
         raise ValueError(f"npr must be between 1 and {os.cpu_count()}")
 
     logger.header()
-
 
     ###########################################################################
     # 1. DEFINING THE CONSTANTS
@@ -221,10 +229,7 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
     ###########################################################################
     logger.info("\n\tBuilding the list of neighbouring k-point pairs to process...")
     tasks = [
-        args
-        for nk in range(m.nks)
-        for j in range(2 * m.dimensions)
-        if (args := get_point_neighbors(nk, j)) is not None
+        args for nk in range(m.nks) for j in range(2 * m.dimensions) if (args := get_point_neighbors(nk, j)) is not None
     ]
     n_tasks = len(tasks)
 
@@ -242,16 +247,18 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
         "noncolin": bool(m.noncolin),
         "n_tasks": n_tasks,
     }
-    logger.info(f"\tResult array dpc: shape {DPC_SHAPE} "
-                f"(~{2 * DPC_SIZE * ctypes.sizeof(ctypes.c_double) / 1e9:.2f} GB), "
-                f"memmapped to {ckpt_path}")
+    logger.info(
+        f"\tResult array dpc: shape {DPC_SHAPE} "
+        f"(~{2 * DPC_SIZE * ctypes.sizeof(ctypes.c_double) / 1e9:.2f} GB), "
+        f"memmapped to {ckpt_path}"
+    )
 
     resume = all(os.path.exists(p) for p in (ckpt_path, mask_path, meta_path))
     if resume:
         try:
             with open(meta_path) as fh:
                 saved_meta = json.load(fh)
-        except (OSError, ValueError):
+        except OSError, ValueError:
             saved_meta = None
         if saved_meta != meta:
             resume = False
@@ -261,15 +268,15 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
         dpc = np.lib.format.open_memmap(ckpt_path, mode="r+")
         done = np.load(mask_path)
         if dpc.shape != DPC_SHAPE or done.shape[0] != n_tasks:
-            resume = False           # header/mask inconsistent: rebuild from scratch
+            resume = False  # header/mask inconsistent: rebuild from scratch
 
     if resume:
         n_already = int(done.sum())
-        logger.info(f"\tResuming from checkpoint: {n_already}/{n_tasks} pairs already done, "
-                    f"{n_tasks - n_already} to compute.")
+        logger.info(
+            f"\tResuming from checkpoint: {n_already}/{n_tasks} pairs already done, {n_tasks - n_already} to compute."
+        )
     else:
-        dpc = np.lib.format.open_memmap(ckpt_path, mode="w+",
-                                        dtype=np.complex128, shape=DPC_SHAPE)
+        dpc = np.lib.format.open_memmap(ckpt_path, mode="w+", dtype=np.complex128, shape=DPC_SHAPE)
         done = np.zeros(n_tasks, dtype=bool)
         with open(meta_path, "w") as fh:
             json.dump(meta, fh)
@@ -292,13 +299,17 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
     # threads so process-level and BLAS-level parallelism don't oversubscribe.
     blas_threads = max(1, os.cpu_count() // npr)
     if threadpool_limits is None:
-        logger.info("\tthreadpoolctl not installed: BLAS thread count is left at its "
-                    "default and may oversubscribe the cores (pip install threadpoolctl).")
+        logger.info(
+            "\tthreadpoolctl not installed: BLAS thread count is left at its "
+            "default and may oversubscribe the cores (pip install threadpoolctl)."
+        )
     else:
         logger.info(f"\tBLAS threads per worker: {blas_threads}")
-    logger.info(f"\t{n_remaining} k-point pairs to process this run, "
-                f"{len(BANDS)}x{len(BANDS)} band pairs each, "
-                f"chunksize {chunksize}.\n")
+    logger.info(
+        f"\t{n_remaining} k-point pairs to process this run, "
+        f"{len(BANDS)}x{len(BANDS)} band pairs each, "
+        f"chunksize {chunksize}.\n"
+    )
 
     width = len(str(n_tasks))
     t0 = time()
@@ -324,11 +335,13 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
                     elapsed = now - t0
                     rate = processed / elapsed if elapsed > 0 else 0.0
                     eta = (n_remaining - processed) / rate if rate > 0 else 0.0
-                    logger.info(f"\t  {done_count:>{width}}/{n_tasks} pairs "
-                                f"({100.0 * done_count / n_tasks:5.1f}%)  "
-                                f"elapsed {_fmt_hms(elapsed)}  "
-                                f"ETA {_fmt_hms(eta)}  "
-                                f"({rate:.1f} pairs/s)")
+                    logger.info(
+                        f"\t  {done_count:>{width}}/{n_tasks} pairs "
+                        f"({100.0 * done_count / n_tasks:5.1f}%)  "
+                        f"elapsed {_fmt_hms(elapsed)}  "
+                        f"ETA {_fmt_hms(eta)}  "
+                        f"({rate:.1f} pairs/s)"
+                    )
                     _flush_logfile()
                     last_log = now
         dpc.flush()
@@ -336,8 +349,7 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
         logger.info(f"\n\tAll {n_tasks} k-point pairs computed in {_fmt_hms(time() - t0)}.")
         _flush_logfile()
     else:
-        logger.info("\tAll k-point pairs were already computed in a previous run; "
-                    "reusing the checkpoint.")
+        logger.info("\tAll k-point pairs were already computed in a previous run; reusing the checkpoint.")
 
     ###########################################################################
     # 6. NORMALIZE AND SAVE OUTPUT
@@ -347,30 +359,31 @@ def run_dot(npr: int = 1, logger_name: str = "dot", logger_level: logging = logg
     # normalizes exactly once.
     logger.info("\tNormalizing dot products and computing modulus...")
     dpc_final = np.array(dpc, dtype=np.complex128)
-    dpc_final /= m.nr          # To normalize the dot product
-    dp = np.abs(dpc_final)     # Calculate the modulus of the dot product
+    dpc_final /= m.nr  # To normalize the dot product
+    dp = np.abs(dpc_final)  # Calculate the modulus of the dot product
 
     if compress:
         np.savez_compressed(os.path.join(m.data_dir, "dpc.npz"), dpc_final)
         np.savez_compressed(os.path.join(m.data_dir, "dp.npz"), dp)
-        logger.info(f"\n\tDot products saved to file dpc.npz")
-        logger.info(f"\tDot products modulus saved to file dp.npz")
+        logger.info("\n\tDot products saved to file dpc.npz")
+        logger.info("\tDot products modulus saved to file dp.npz")
     else:
         np.save(os.path.join(m.data_dir, "dpc.npy"), dpc_final)
         np.save(os.path.join(m.data_dir, "dp.npy"), dp)
-        logger.info(f"\n\tDot products saved to file dpc.npy")
-        logger.info(f"\tDot products modulus saved to file dp.npy")
+        logger.info("\n\tDot products saved to file dpc.npy")
+        logger.info("\tDot products modulus saved to file dp.npy")
 
     ###########################################################################
     # 7. REMOVE CHECKPOINT
     ###########################################################################
-    del dpc                    # close the memmap before deleting its backing file
+    del dpc  # close the memmap before deleting its backing file
     _cleanup_ckpt(ckpt_path, mask_path, meta_path)
 
     ###########################################################################
     # Finished
     ###########################################################################
     logger.footer()
+
 
 if __name__ == "__main__":
     run_dot(log("dotproduct", "DOT PRODUCT", "version"), 20)
