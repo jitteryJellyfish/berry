@@ -1,0 +1,360 @@
+from multiprocessing import Pool, Array
+
+import os
+from time import time
+import ctypes
+import logging
+
+from findiff import Gradient
+
+import numpy as np
+
+from berry import log
+
+try:
+    import berry._subroutines.loaddata as d
+    import berry._subroutines.loadmeta as m
+except:
+    pass
+
+
+def read_wfc_files(banda: int, npr: int) -> None:
+    global read_wfc_kp
+
+    def read_wfc_kp(kp):
+        # NOT_SOLVED sentinel: cluster left this (k-point, band) slot unattributed (-1),
+        # so there is no raw QE band to read. Zero-fill the column and skip the point
+        # (warned once per band in the parent below) instead of crashing on a missing file.
+        if bandsfinal[kp, banda] < 0:
+            if m.noncolin:
+                wfct_k0[:, kp] = 0
+                wfct_k1[:, kp] = 0
+            else:
+                wfct_k[:, kp] = 0
+            return
+
+        b = bandsfinal[kp, banda] + initial_band
+
+        if m.noncolin:
+            infile0  = f"{m.wfcdirectory}/k0{kp}b0{b}-0.wfc"
+            infile1  = f"{m.wfcdirectory}/k0{kp}b0{b}-1.wfc"
+            tmp = np.load(infile0)
+            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
+                wfct_k0[:, kp] = tmp['arr_0']
+            else:
+                wfct_k0[:, kp] = tmp
+
+            tmp = np.load(infile1)
+            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
+                wfct_k1[:, kp] = tmp['arr_0']
+            else:
+                wfct_k1[:, kp] = tmp
+        else:
+            infile = f"{m.wfcdirectory}/k0{kp}b0{b}.wfc"
+
+            tmp = np.load(infile)
+            if isinstance(tmp, np.lib.npyio.NpzFile): # check if is npz file, which is can compressed
+                wfct_k[:, kp] = tmp['arr_0']
+            else:
+                wfct_k[:, kp] = tmp
+
+    missing = np.where(bandsfinal[:, banda] < 0)[0]
+    if missing.size:
+        b_true = banda + initial_band
+        preview = missing.tolist() if missing.size <= 50 else missing[:50].tolist() + ["..."]
+        # zero-filled here; interpolate_wfcpos() replaces these before the gradient and warns.
+        logger.debug(f"\tband {b_true}: {missing.size}/{m.nks} k-point(s) unattributed (-1) in bandsfinal; "
+                     f"zero-filling, to be interpolated before gradient: {preview}")
+
+    with Pool(min(10, npr)) as pool: #TODO: try to abstract this operation
+        pool.map(read_wfc_kp, range(m.nks))
+
+
+def calculate_wfcpos(npr: int) -> np.ndarray:
+    """Arrange the periodic parts u_nk(r) on the k-mesh.
+
+    u-convention: the .wfc files hold u_nk(r) (wfck2r.x output) and the k-space
+    derivative in calculate_wfcgra acts directly on u, so wfcpos is just u
+    re-indexed onto the (kx, ky, kz) mesh -- NO Bloch-phase multiplication.
+    """
+    global calculate_wfcpos_kp
+    if m.dimensions == 1:
+        def calculate_wfcpos_kp(kp):
+            if m.noncolin:
+                wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, 0, 0]]
+                wfcpos1[kp] = wfct_k1[kp, d.ijltonk[:, 0, 0]]
+            else:
+                wfcpos[kp] = wfct_k[kp, d.ijltonk[:, 0, 0]]
+
+        with Pool(npr) as pool:
+            pool.map(calculate_wfcpos_kp, range(m.nr))
+
+    elif m.dimensions == 2:
+        def calculate_wfcpos_kp(kp):
+            if m.noncolin:
+                wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, :, 0]]
+                wfcpos1[kp] = wfct_k1[kp, d.ijltonk[:, :, 0]]
+            else:
+                wfcpos[kp] = wfct_k[kp, d.ijltonk[:, :, 0]]
+
+        with Pool(npr) as pool:
+            pool.map(calculate_wfcpos_kp, range(m.nr))
+
+    else:
+        def calculate_wfcpos_kp(kp):
+            if m.noncolin:
+                wfcpos0[kp] = wfct_k0[kp, d.ijltonk[:, :, :]]
+                wfcpos1[kp] = wfct_k1[kp, d.ijltonk[:, :, :]]
+            else:
+                wfcpos[kp] = wfct_k[kp, d.ijltonk[:, :, :]]
+
+        with Pool(npr) as pool:
+            pool.map(calculate_wfcpos_kp, range(m.nr))
+
+
+def calculate_wfcgra(npr: int) -> np.ndarray:
+    global calculate_wfcgra_kp
+
+    def calculate_wfcgra_kp(kp):
+        if m.noncolin:
+            wfcgra0[kp] = grad(wfcpos0[kp])
+            wfcgra1[kp] = grad(wfcpos1[kp])
+
+        else:
+            wfcgra[kp] = grad(wfcpos[kp])
+
+    with Pool(npr) as pool:
+        pool.map(calculate_wfcgra_kp, range(m.nr))
+
+
+def interpolate_wfcpos(banda: int) -> None:
+    """Replace wfcpos at unattributed (-1) k-points with the average of their valid in-BZ
+    neighbours, BEFORE the k-space gradient is taken.
+
+    cluster leaves bandsfinal == -1 where it could not attribute a band, and read_wfc_files
+    zero-fills those k-points (there is no raw .wfc to read). Interpolating here -- upstream of
+    calculate_wfcgra -- keeps the zero-fill discontinuity out of the gradient stencil, so
+    neither the bad k-point nor its neighbours get a corrupted wfcgra. Warns once per band; a
+    bad k-point with no attributed neighbour is left zero (reported in the warning)."""
+    bad_kps = np.where(bandsfinal[:, banda] < 0)[0]
+    if bad_kps.size == 0:
+        return
+
+    bad_set = {int(k) for k in bad_kps}
+    targets = (wfcpos0, wfcpos1) if m.noncolin else (wfcpos,)  # last m.dimensions axes = k-mesh
+    n_interp = n_orphan = 0
+    for kp in bad_kps:
+        ij = tuple(int(x) for x in d.nktoijl[kp][:m.dimensions])
+        neigh = [tuple(int(x) for x in d.nktoijl[nb][:m.dimensions])
+                 for nb in d.neighbors[kp] if nb >= 0 and int(nb) not in bad_set]
+        if not neigh:
+            n_orphan += 1
+            continue
+        for arr in targets:
+            arr[(Ellipsis,) + ij] = np.mean([arr[(Ellipsis,) + nij] for nij in neigh], axis=0)
+        n_interp += 1
+
+    b_true = banda + initial_band
+    msg = (f"\tband {b_true}: {bad_kps.size} unattributed (-1) k-point(s); "
+           f"interpolated wfcpos from BZ neighbours before gradient")
+    if n_orphan:
+        msg += f" ({n_orphan} left zero -- no attributed neighbour)"
+    logger.warning(msg)
+
+
+def r_to_k(banda: int, npr: int, compress: bool, save_gra: bool) -> None:
+    b = banda + initial_band # true band
+
+    need_pos = b not in bands_pos
+    # wfcgra is only written on request (-savegra): geometry applies the same
+    # findiff gradient on the fly while streaming wfcpos, so the files are
+    # redundant 
+    need_gra = save_gra and b not in bands_gra
+    if not need_pos and not need_gra:
+        logger.debug(f"\tband {b} already saved, skipping")
+        return
+
+    # the buffers hold nothing usable on entry (fresh process on resume, or a
+    # previous band), so wfcpos must be rebuilt whenever anything is written. 
+    start = time()
+    read_wfc_files(banda, npr)
+    logger.debug(f"\twfc files read in {time() - start:.2f} seconds")
+
+    start = time()
+    calculate_wfcpos(npr)
+    logger.info(f"\twfcpos{b} calculated in {time() - start:.2f} seconds")
+    interpolate_wfcpos(banda)  # fix -1 k-points before the gradient is taken
+
+    if need_gra:
+        start = time()
+        calculate_wfcgra(npr)
+        logger.info(f"\twfcgra{b} calculated in {time() - start:.2f} seconds")
+
+    start = time()
+    #IDEA: Try saving this files into a folder in different chunks
+    save = np.savez_compressed if compress else np.save
+    ext = "npz" if compress else "npy"
+    if m.noncolin:
+        if need_pos:
+            save(os.path.join(m.data_dir, f"wfcpos{b}-0.{ext}"), wfcpos0)
+            save(os.path.join(m.data_dir, f"wfcpos{b}-1.{ext}"), wfcpos1)
+            bands_pos.append(b)
+        if need_gra:
+            save(os.path.join(m.data_dir, f"wfcgra{b}-0.{ext}"), wfcgra0)
+            save(os.path.join(m.data_dir, f"wfcgra{b}-1.{ext}"), wfcgra1)
+            bands_gra.append(b)
+    else:
+        if need_pos:
+            save(os.path.join(m.data_dir, f"wfcpos{b}.{ext}"), wfcpos)
+            bands_pos.append(b)
+        if need_gra:
+            save(os.path.join(m.data_dir, f"wfcgra{b}.{ext}"), wfcgra)
+            bands_gra.append(b)
+
+    logger.debug(f"\twfcpos{b}{f' and wfcgra{b}' if need_gra else ''} saved in {time() - start:.2f} seconds\n")
+
+def save_r2k(bpos, bgra):
+    # saving the bands already done
+    bpos = list(map(lambda x: str(x), bpos))
+    bgra = list(map(lambda x: str(x), bgra))
+
+    with open(os.path.join(m.workdir, save_file), 'w') as f:
+        f.write(' '.join(["bands_pos"] + bpos) + "\n")
+        f.write(' '.join(["bands_gra"] + bgra) + "\n")
+
+
+
+def run_r2k(max_band: int, npr: int = 1, min_band: int = 0, logger_name: str = "r2k", logger_level: int = logging.INFO, compress: bool = False, flush: bool = False, save_gra: bool = False):
+    if m.noncolin:
+        global grad, bandsfinal, wfct_k0, wfct_k1, wfcpos0, wfcpos1, wfcgra0, wfcgra1, logger, initial_band, save_file, bands_pos, bands_gra
+    else:
+        global grad, bandsfinal, wfct_k, wfcpos, wfcgra, logger, initial_band, save_file, bands_pos, bands_gra
+
+    initial_band = m.initial_band if m.initial_band != "dummy" else 0 # for backward compatibility
+
+    # current program state file
+    save_file = ".r2k.save" # file name
+    saved = False           # existing file
+    bands_pos = []
+    bands_gra = []
+    # reading save file
+    if os.path.exists(os.path.join(m.workdir, save_file)):
+        with open(os.path.join(m.workdir, save_file), 'r') as f:
+            lines = f.readlines()
+        for line in lines:
+            ii = line.split()
+            if ii[0] == "bands_pos":
+                bands_pos = list(map(lambda x: int(x),ii[1:]))
+                saved = True
+            if ii[0] == "bands_gra":
+                bands_gra = list(map(lambda x: int(x), ii[1:]))
+                saved = True
+
+    logger = log(logger_name, "R2K", level=logger_level, flush=flush)
+
+    logger.header()
+
+    ###########################################################################
+    # 1. DEFINING THE CONSTANTS
+    ########################################################################### 
+
+    WFCT_K_SHAPE = (m.nr, m.nks)
+    if m.dimensions == 1:
+        WFCPOS_SHAPE = (m.nr, m.nkx)
+        WFCGRA_SHAPE = (m.nr, m.dimensions, m.nkx)
+    elif m.dimensions == 2:
+        WFCPOS_SHAPE = (m.nr, m.nkx, m.nky)
+        WFCGRA_SHAPE = (m.nr, m.dimensions, m.nkx, m.nky)
+    else:
+        WFCPOS_SHAPE = (m.nr, m.nkx, m.nky, m.nkz)
+        WFCGRA_SHAPE = (m.nr, m.dimensions, m.nkx, m.nky, m.nkz)
+
+    WFCT_K_SIZE = m.nr * m.nks
+    WFCPOS_SIZE = m.nr * m.nkx * m.nky * m.nkz
+    WFCGRA_SIZE = m.nr * m.dimensions * m.nkx * m.nky * m.nkz
+
+    ###########################################################################
+    # 2. STDOUT THE PARAMETERS
+    ########################################################################### 
+    logger.info(f"\tUnique reference of run: {m.refname}")
+    logger.info(f"\tNumber of processors to use: {npr}")
+    logger.info(f"\tMinimum band: {min_band}")
+    logger.info(f"\tMaximum band: {max_band}")
+    logger.info(f"\tk-points step, dk: {m.step}")
+    logger.info(f"\tTotal number of k-points: {m.nks}")
+    logger.info(f"\tTotal number of points in real space: {m.nr}")
+    logger.info(f"\tNumber of k-points in each direction: {m.nkx} {m.nky} {m.nkz}")
+    logger.info(f"\tDirectory where the wfc are: {m.wfcdirectory}\n")
+    logger.info(f"\n\t{m.dimensions} dimensions calculation.")
+
+    if saved:
+        logger.info(f"\n\tSaved data found in '{save_file}'. Resuming calculations.")
+
+    ###########################################################################
+    # 3. CREATE ALL THE ARRAYS AND GRADIENT
+    ###########################################################################
+    if m.dimensions == 1:                   # Defines gradient function in 1, 2 and 3D
+        grad = Gradient(h=[m.step], acc=2)
+    elif m.dimensions == 2:
+        grad = Gradient(h=[m.step, m.step], acc=2) 
+    else:
+        grad = Gradient(h=[m.step, m.step, m.step], acc=2)
+
+    # u-convention: phase.npy is intentionally NOT loaded -- wfcpos holds the
+    # periodic parts u_nk directly (see calculate_wfcpos docstring).
+    bandsfinal = np.load(os.path.join(m.data_dir, "bandsfinal.npy"))
+    logger.info(f"\tSignal and bands files loaded")
+
+    if m.noncolin:
+        # NOTE: each array needs its own buffer.
+        buffer0 = Array(ctypes.c_double, 2 * WFCT_K_SIZE, lock=False)
+        buffer1 = Array(ctypes.c_double, 2 * WFCT_K_SIZE, lock=False)
+        wfct_k0 = np.frombuffer(buffer0, dtype=np.complex128).reshape(WFCT_K_SHAPE)
+        wfct_k1 = np.frombuffer(buffer1, dtype=np.complex128).reshape(WFCT_K_SHAPE)
+
+        buffer0 = Array(ctypes.c_double, 2 * WFCPOS_SIZE, lock=False)
+        buffer1 = Array(ctypes.c_double, 2 * WFCPOS_SIZE, lock=False)
+        wfcpos0 = np.frombuffer(buffer0, dtype=np.complex128).reshape(WFCPOS_SHAPE)
+        wfcpos1 = np.frombuffer(buffer1, dtype=np.complex128).reshape(WFCPOS_SHAPE)
+
+        if save_gra:
+            buffer0 = Array(ctypes.c_double, 2 * WFCGRA_SIZE, lock=False)
+            buffer1 = Array(ctypes.c_double, 2 * WFCGRA_SIZE, lock=False)
+            wfcgra0 = np.frombuffer(buffer0, dtype=np.complex128).reshape(WFCGRA_SHAPE)
+            wfcgra1 = np.frombuffer(buffer1, dtype=np.complex128).reshape(WFCGRA_SHAPE)
+
+    else:
+        buffer = Array(ctypes.c_double, 2 * WFCT_K_SIZE, lock=False)
+        wfct_k = np.frombuffer(buffer, dtype=np.complex128).reshape(WFCT_K_SHAPE)
+
+        buffer = Array(ctypes.c_double, 2 * WFCPOS_SIZE, lock=False)
+        wfcpos = np.frombuffer(buffer, dtype=np.complex128).reshape(WFCPOS_SHAPE)
+
+        if save_gra:
+            buffer = Array(ctypes.c_double, 2 * WFCGRA_SIZE, lock=False)
+            wfcgra = np.frombuffer(buffer, dtype=np.complex128).reshape(WFCGRA_SHAPE)
+
+
+    ###########################################################################
+    # 4. CALCULATE
+    ###########################################################################
+    try:
+        for banda in range(min_band - initial_band, max_band - initial_band + 1):
+            r_to_k(banda, npr, compress, save_gra)
+            save_r2k(bands_pos, bands_gra) # saving the current state of the execution
+    except Exception as err:
+        save_r2k(bands_pos, bands_gra)
+        raise err
+
+    ###########################################################################
+    # Finished
+    ###########################################################################
+    if os.path.exists(os.path.join(m.workdir, save_file)):
+        os.remove(os.path.join(m.workdir, save_file))
+    logger.footer()
+
+if __name__ == "__main__":
+    run_r2k(9, log("r2k", "R2K", "version", logging.DEBUG), 20)
+
+
+    

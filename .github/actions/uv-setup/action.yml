@@ -1,0 +1,15 @@
+---
+name: Install uv
+description: Install uv and sync the Berry development dependencies
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+
+    - name: Sync development dependencies
+      shell: bash
+      run: uv sync --group dev
